@@ -1,0 +1,27 @@
+[package]
+name = "nvrdesk-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nvrdesk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nvrdesk-capture = { path = "../nvrdesk-capture" }
+nvrdesk-codec = { path = "../nvrdesk-codec" }
+nvrdesk-core = { path = "../nvrdesk-core" }
+nvrdesk-pipeline = { path = "../nvrdesk-pipeline" }
+nvrdesk-rtsp = { path = "../nvrdesk-rtsp" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

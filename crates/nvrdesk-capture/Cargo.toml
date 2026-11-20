@@ -1,0 +1,16 @@
+[package]
+name = "nvrdesk-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nvrdesk-core = { path = "../nvrdesk-core" }
+tracing.workspace = true
+xcap.workspace = true
