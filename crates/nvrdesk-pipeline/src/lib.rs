@@ -1,10 +1,13 @@
-//! Video processing pipeline: scaling and SIMD RGB/BGRA -> I420 conversion.
+//! Video processing pipeline: scaling, visual overlays, JPEG snapshots, and SIMD YUV420p conversion.
+
+pub mod overlay;
 
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{Image, ImageRef},
 };
-use nvrdesk_core::{I420Frame, NvrDeskError, PixelFormat, RawVideoFrame};
+use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
+use nvrdesk_core::{I420Frame, InputOverlaySnapshot, NvrDeskError, PixelFormat, RawVideoFrame};
 use yuvutils_rs::{
     BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
     bgra_to_yuv420, rgb_to_yuv420, rgba_to_yuv420,
@@ -27,11 +30,11 @@ pub fn compute_target_dimensions(src_w: u32, src_h: u32, max_width: u32) -> (u32
     (even_w, even_h)
 }
 
-/// Stateful frame scaler and color converter reusing scratch buffers across frames.
+/// Stateful frame scaler, overlay composer, and I420 converter reusing scratch buffers.
 pub struct FrameProcessor {
     resizer: Resizer,
     tight_src_buf: Vec<u8>,
-    resized_buf: Vec<u8>,
+    work_buf: Vec<u8>,
 }
 
 impl Default for FrameProcessor {
@@ -47,16 +50,65 @@ impl FrameProcessor {
         Self {
             resizer: Resizer::new(),
             tight_src_buf: Vec::new(),
-            resized_buf: Vec::new(),
+            work_buf: Vec::new(),
         }
     }
 
-    /// Scales (if larger than `max_width` or odd-sized) and converts `frame` into planar I420.
+    /// Scales (if needed), renders `overlay` at target resolution, and converts to planar I420.
+    pub fn process_with_overlay(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+    ) -> Result<I420Frame, NvrDeskError> {
+        let (dst_w, dst_h, dst_stride) = self.prepare_packed(frame, max_width, overlay_snap)?;
+        convert_packed_to_i420(
+            &self.work_buf,
+            dst_stride as u32,
+            dst_w,
+            dst_h,
+            frame.format,
+            frame.timestamp_us,
+        )
+    }
+
+    /// Scales and converts `frame` into planar I420 without overlays.
     pub fn process(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
     ) -> Result<I420Frame, NvrDeskError> {
+        self.process_with_overlay(frame, max_width, None)
+    }
+
+    /// Scales, renders `overlay`, and encodes a JPEG snapshot in memory.
+    pub fn encode_jpeg_snapshot(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        quality: u8,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+    ) -> Result<Vec<u8>, NvrDeskError> {
+        let (dst_w, dst_h, _) = self.prepare_packed(frame, max_width, overlay_snap)?;
+        let color_type = match frame.format {
+            PixelFormat::Bgra8 => ColorType::Bgra,
+            PixelFormat::Rgba8 => ColorType::Rgba,
+            PixelFormat::Rgb8 => ColorType::Rgb,
+        };
+        let mut out = Vec::with_capacity(64 * 1024);
+        let encoder = JpegEncoder::new(&mut out, quality.clamp(10, 100));
+        encoder
+            .encode(&self.work_buf, dst_w as u16, dst_h as u16, color_type)
+            .map_err(|e| NvrDeskError::Pipeline(format!("jpeg snapshot encode failed: {e}")))?;
+        Ok(out)
+    }
+
+    fn prepare_packed(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+    ) -> Result<(u32, u32, usize), NvrDeskError> {
         let (dst_w, dst_h) = compute_target_dimensions(frame.width, frame.height, max_width);
         if dst_w == 0 || dst_h == 0 {
             return Err(NvrDeskError::InvalidDimensions {
@@ -78,58 +130,66 @@ impl FrameProcessor {
             )));
         }
 
+        let dst_stride = (dst_w as usize) * bpp;
+        self.work_buf.resize(dst_stride * (dst_h as usize), 0);
+
         if dst_w == frame.width && dst_h == frame.height {
-            return convert_packed_to_i420(
-                &frame.data,
-                frame.stride as u32,
-                frame.width,
-                frame.height,
+            if frame.stride == dst_stride {
+                self.work_buf
+                    .copy_from_slice(&frame.data[..dst_stride * (dst_h as usize)]);
+            } else {
+                for row in 0..(dst_h as usize) {
+                    let src_start = row * frame.stride;
+                    let dst_start = row * dst_stride;
+                    self.work_buf[dst_start..dst_start + dst_stride]
+                        .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+                }
+            }
+        } else {
+            let src_slice = if frame.stride == min_row_bytes {
+                &frame.data[..min_row_bytes * (frame.height as usize)]
+            } else {
+                self.tight_src_buf
+                    .resize(min_row_bytes * (frame.height as usize), 0);
+                for row in 0..(frame.height as usize) {
+                    let src_start = row * frame.stride;
+                    let dst_start = row * min_row_bytes;
+                    self.tight_src_buf[dst_start..dst_start + min_row_bytes]
+                        .copy_from_slice(&frame.data[src_start..src_start + min_row_bytes]);
+                }
+                &self.tight_src_buf
+            };
+
+            let pixel_type = match frame.format {
+                PixelFormat::Bgra8 | PixelFormat::Rgba8 => PixelType::U8x4,
+                PixelFormat::Rgb8 => PixelType::U8x3,
+            };
+
+            let src_img = ImageRef::new(frame.width, frame.height, src_slice, pixel_type)
+                .map_err(|e| NvrDeskError::Pipeline(format!("resize source init: {e}")))?;
+
+            let mut dst_img = Image::from_slice_u8(dst_w, dst_h, &mut self.work_buf, pixel_type)
+                .map_err(|e| NvrDeskError::Pipeline(format!("resize dest init: {e}")))?;
+
+            let options =
+                ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+            self.resizer
+                .resize(&src_img, &mut dst_img, &options)
+                .map_err(|e| NvrDeskError::Pipeline(format!("resize failed: {e}")))?;
+        }
+
+        if let Some(snap) = overlay_snap {
+            overlay::draw_overlays(
+                &mut self.work_buf,
+                dst_w,
+                dst_h,
+                dst_stride,
                 frame.format,
-                frame.timestamp_us,
+                snap,
             );
         }
 
-        // fast_image_resize expects tightly packed rows.
-        let src_slice = if frame.stride == min_row_bytes {
-            &frame.data[..min_row_bytes * (frame.height as usize)]
-        } else {
-            self.tight_src_buf
-                .resize(min_row_bytes * (frame.height as usize), 0);
-            for row in 0..(frame.height as usize) {
-                let src_start = row * frame.stride;
-                let dst_start = row * min_row_bytes;
-                self.tight_src_buf[dst_start..dst_start + min_row_bytes]
-                    .copy_from_slice(&frame.data[src_start..src_start + min_row_bytes]);
-            }
-            &self.tight_src_buf
-        };
-
-        let pixel_type = match frame.format {
-            PixelFormat::Bgra8 | PixelFormat::Rgba8 => PixelType::U8x4,
-            PixelFormat::Rgb8 => PixelType::U8x3,
-        };
-
-        let src_img = ImageRef::new(frame.width, frame.height, src_slice, pixel_type)
-            .map_err(|e| NvrDeskError::Pipeline(format!("resize source init: {e}")))?;
-
-        let dst_stride = (dst_w as usize) * bpp;
-        self.resized_buf.resize(dst_stride * (dst_h as usize), 0);
-        let mut dst_img = Image::from_slice_u8(dst_w, dst_h, &mut self.resized_buf, pixel_type)
-            .map_err(|e| NvrDeskError::Pipeline(format!("resize dest init: {e}")))?;
-
-        let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
-        self.resizer
-            .resize(&src_img, &mut dst_img, &options)
-            .map_err(|e| NvrDeskError::Pipeline(format!("resize failed: {e}")))?;
-
-        convert_packed_to_i420(
-            &self.resized_buf,
-            dst_stride as u32,
-            dst_w,
-            dst_h,
-            frame.format,
-            frame.timestamp_us,
-        )
+        Ok((dst_w, dst_h, dst_stride))
     }
 }
 
@@ -219,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn processes_rgba_with_padding_stride() {
+    fn processes_rgba_with_padding_stride_and_jpeg_snapshot() {
         let mut proc = FrameProcessor::new();
         let stride = 320 * 4 + 16;
         let raw = RawVideoFrame {
@@ -233,5 +293,10 @@ mod tests {
         let out = proc.process(&raw, 1920).expect("process succeeds");
         assert_eq!(out.width, 320);
         assert_eq!(out.height, 240);
+
+        let jpeg = proc
+            .encode_jpeg_snapshot(&raw, 320, 80, None)
+            .expect("jpeg snapshot succeeds");
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]), "valid JPEG SOI header");
     }
 }

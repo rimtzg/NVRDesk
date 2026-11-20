@@ -13,7 +13,9 @@ workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+md-5.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 rtsp-types.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true

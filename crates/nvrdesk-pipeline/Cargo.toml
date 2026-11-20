@@ -12,5 +12,7 @@ workspace = true
 
 [dependencies]
 fast_image_resize.workspace = true
+jpeg-encoder.workspace = true
+noto-sans-mono-bitmap.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 yuvutils-rs.workspace = true

@@ -8,14 +8,32 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use nvrdesk_core::{NvrDeskError, PixelFormat, RawVideoFrame};
+use nvrdesk_core::{MonitorBounds, NvrDeskError, PixelFormat, RawVideoFrame};
 use tracing::{debug, warn};
-use xcap::{Frame as XcapFrame, Monitor};
+use xcap::{Frame as XcapFrame, Monitor, Window};
+
+/// Returns the title of the currently focused OS window, if available.
+#[must_use]
+pub fn focused_window_title() -> Option<String> {
+    let windows = Window::all().ok()?;
+    windows.into_iter().find_map(|w| {
+        if w.is_focused().unwrap_or(false) {
+            w.title().ok()
+        } else {
+            None
+        }
+    })
+}
 
 /// Abstraction over a video capture backend (display, window, webcam, or synthetic generator).
 pub trait CaptureSource: Send {
     /// Human-readable source identifier.
     fn name(&self) -> &str;
+
+    /// Returns the OS virtual desktop bounds of the captured monitor, when known.
+    fn bounds(&self) -> Option<MonitorBounds> {
+        None
+    }
 
     /// Starts frame capture.
     fn start(&mut self) -> Result<(), NvrDeskError>;
@@ -34,6 +52,7 @@ pub trait CaptureSource: Send {
 pub struct ScreenCaptureSource {
     name: String,
     display_index: usize,
+    bounds: Option<MonitorBounds>,
     running: Arc<AtomicBool>,
     rx: Option<mpsc::Receiver<Result<RawVideoFrame, NvrDeskError>>>,
     worker: Option<JoinHandle<()>>,
@@ -46,6 +65,7 @@ impl ScreenCaptureSource {
         Self {
             name: format!("screen:{display_index}"),
             display_index,
+            bounds: None,
             running: Arc::new(AtomicBool::new(false)),
             rx: None,
             worker: None,
@@ -81,6 +101,10 @@ impl CaptureSource for ScreenCaptureSource {
         &self.name
     }
 
+    fn bounds(&self) -> Option<MonitorBounds> {
+        self.bounds
+    }
+
     fn start(&mut self) -> Result<(), NvrDeskError> {
         if self.running.load(Ordering::Acquire) {
             return Ok(());
@@ -107,6 +131,17 @@ impl CaptureSource for ScreenCaptureSource {
                 let monitor_name = monitor
                     .name()
                     .unwrap_or_else(|_| format!("screen:{display_index}"));
+                let bounds = match (monitor.x(), monitor.y(), monitor.width(), monitor.height()) {
+                    (Ok(x), Ok(y), Ok(width), Ok(height)) if width > 0 && height > 0 => {
+                        Some(MonitorBounds {
+                            x,
+                            y,
+                            width,
+                            height,
+                        })
+                    }
+                    _ => None,
+                };
                 let (recorder, raw_rx) = match monitor.video_recorder() {
                     Ok(pair) => pair,
                     Err(err) => {
@@ -119,8 +154,8 @@ impl CaptureSource for ScreenCaptureSource {
                     return;
                 }
 
-                debug!(monitor = %monitor_name, "screen capture started");
-                let _ = init_tx.send(Ok(()));
+                debug!(monitor = %monitor_name, ?bounds, "screen capture started");
+                let _ = init_tx.send(Ok(bounds));
 
                 let start_time = Instant::now();
                 capture_loop(raw_rx, &tx, &running, start_time);
@@ -132,7 +167,8 @@ impl CaptureSource for ScreenCaptureSource {
             .map_err(|e| NvrDeskError::Capture(format!("failed to spawn capture thread: {e}")))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(bounds)) => {
+                self.bounds = bounds;
                 self.rx = Some(rx);
                 self.worker = Some(worker);
                 Ok(())
@@ -277,6 +313,15 @@ impl TestPatternSource {
 impl CaptureSource for TestPatternSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn bounds(&self) -> Option<MonitorBounds> {
+        Some(MonitorBounds {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        })
     }
 
     fn start(&mut self) -> Result<(), NvrDeskError> {

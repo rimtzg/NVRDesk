@@ -1,5 +1,6 @@
-//! Async RTSP 1.0 server supporting TCP Interleaved and UDP Unicast RTP/H.264 delivery.
+//! Async RTSP 1.0 server supporting multi-stream, Digest auth, TCP Interleaved, and UDP Unicast.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
@@ -19,12 +20,13 @@ use tokio::{
     sync::{Notify, broadcast, watch},
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::{rtp::H264RtpPacketizer, sdp::build_h264_sdp};
+use crate::{auth::RtspAuthConfig, rtp::H264RtpPacketizer, sdp::build_h264_sdp};
 
 const FRAME_BROADCAST_CAPACITY: usize = 64;
 
-/// Configuration for the RTSP server.
+/// Configuration for a single-stream RTSP server (`RtspServer::bind`).
 #[derive(Debug, Clone)]
 pub struct RtspServerConfig {
     /// Socket address to bind on (e.g. `0.0.0.0:8554`).
@@ -45,8 +47,19 @@ impl Default for RtspServerConfig {
     }
 }
 
+/// Definition of a stream mount point on a multi-stream RTSP server.
+#[derive(Debug, Clone)]
+pub struct RtspStreamSpec {
+    /// Primary RTSP path (e.g. `/stream1`).
+    pub path: String,
+    /// Optional alias paths pointing to the same stream (e.g. `/stream`).
+    pub aliases: Vec<String>,
+    /// SDP session name (`s=` line).
+    pub name: String,
+}
+
 #[derive(Clone)]
-struct SharedStreamState {
+struct StreamEntry {
     stream_path: String,
     stream_name: String,
     frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
@@ -55,18 +68,51 @@ struct SharedStreamState {
     demand_count: Arc<AtomicUsize>,
     demand_tx: watch::Sender<usize>,
     play_count: Arc<AtomicUsize>,
-    next_session_id: Arc<AtomicU64>,
 }
 
-impl SharedStreamState {
+impl StreamEntry {
+    fn new(stream_path: String, stream_name: String) -> Arc<Self> {
+        let (frame_tx, _) = broadcast::channel(FRAME_BROADCAST_CAPACITY);
+        let (demand_tx, _) = watch::channel(0usize);
+        Arc::new(Self {
+            stream_path,
+            stream_name,
+            frame_tx,
+            param_sets: Arc::new(RwLock::new(None)),
+            param_notify: Arc::new(Notify::new()),
+            demand_count: Arc::new(AtomicUsize::new(0)),
+            demand_tx,
+            play_count: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
     fn add_demand(&self) -> DemandGuard {
         let prev = self.demand_count.fetch_add(1, Ordering::AcqRel);
-        let new_val = prev + 1;
-        let _ = self.demand_tx.send(new_val);
+        let _ = self.demand_tx.send(prev + 1);
         DemandGuard {
             count: Arc::clone(&self.demand_count),
             tx: self.demand_tx.clone(),
         }
+    }
+}
+
+#[derive(Clone)]
+struct ServerState {
+    streams: Arc<HashMap<String, Arc<StreamEntry>>>,
+    auth: Option<RtspAuthConfig>,
+    next_session_id: Arc<AtomicU64>,
+}
+
+impl ServerState {
+    fn resolve_stream(&self, uri_path: &str) -> Option<&Arc<StreamEntry>> {
+        if let Some(exact) = self.streams.get(uri_path) {
+            return Some(exact);
+        }
+        // Strip `/trackID=...` suffix for SETUP requests.
+        if let Some((base, _)) = uri_path.rsplit_once("/trackID=") {
+            return self.streams.get(base);
+        }
+        None
     }
 }
 
@@ -92,78 +138,115 @@ impl Drop for PlayGuard {
     }
 }
 
-/// Handle used by the encoder loop to publish H.264 frames and monitor client demand.
+/// Handle used by an encoder loop to publish H.264 frames and monitor client demand.
 #[derive(Clone)]
 pub struct RtspStreamHandle {
-    state: SharedStreamState,
+    entry: Arc<StreamEntry>,
 }
 
 impl RtspStreamHandle {
-    /// Publishes an encoded H.264 access unit to all playing RTSP clients.
+    /// Publishes an encoded H.264 access unit to all playing RTSP clients on this stream.
     pub fn publish_frame(&self, frame: EncodedFrame) {
         if let (Some(sps), Some(pps)) = (&frame.sps, &frame.pps) {
-            let mut guard = self.state.param_sets.write().expect("param_sets lock");
+            let mut guard = self.entry.param_sets.write().expect("param_sets lock");
             let changed = guard.as_ref().is_none_or(|(s, p)| s != sps || p != pps);
             if changed {
                 *guard = Some((sps.clone(), pps.clone()));
-                self.state.param_notify.notify_waiters();
+                self.entry.param_notify.notify_waiters();
             }
         }
-        let _ = self.state.frame_tx.send(Arc::new(frame));
+        let _ = self.entry.frame_tx.send(Arc::new(frame));
     }
 
     /// Returns a watch receiver carrying the number of clients demanding capture/encoding.
     #[must_use]
     pub fn subscribe_demand(&self) -> watch::Receiver<usize> {
-        self.state.demand_tx.subscribe()
+        self.entry.demand_tx.subscribe()
     }
 
-    /// Returns the number of RTSP sessions currently in `PLAY` state.
+    /// Returns the number of RTSP sessions currently in `PLAY` state on this stream.
     #[must_use]
     pub fn active_players(&self) -> usize {
-        self.state.play_count.load(Ordering::Acquire)
+        self.entry.play_count.load(Ordering::Acquire)
     }
 }
 
 /// Async RTSP 1.0 server.
 pub struct RtspServer {
     listener: TcpListener,
-    state: SharedStreamState,
+    state: ServerState,
 }
 
 impl RtspServer {
-    /// Binds an RTSP server on `config.bind_addr` and returns `(server, local_addr, handle)`.
+    /// Binds a single-stream RTSP server on `config.bind_addr`.
     pub async fn bind(
         config: RtspServerConfig,
     ) -> Result<(Self, SocketAddr, RtspStreamHandle), NvrDeskError> {
-        let listener = TcpListener::bind(config.bind_addr).await?;
-        let local_addr = listener.local_addr()?;
-        let normalized_path = normalize_stream_path(&config.stream_path);
-        let (frame_tx, _) = broadcast::channel(FRAME_BROADCAST_CAPACITY);
-        let (demand_tx, _) = watch::channel(0usize);
+        let spec = RtspStreamSpec {
+            path: config.stream_path.clone(),
+            aliases: Vec::new(),
+            name: config.stream_name,
+        };
+        let (server, addr, mut handles) =
+            Self::bind_streams(config.bind_addr, None, vec![spec]).await?;
+        let norm_path = normalize_stream_path(&config.stream_path);
+        let handle = handles
+            .remove(&norm_path)
+            .ok_or_else(|| NvrDeskError::Rtsp("missing primary stream handle".into()))?;
+        Ok((server, addr, handle))
+    }
 
-        let state = SharedStreamState {
-            stream_path: normalized_path,
-            stream_name: config.stream_name,
-            frame_tx,
-            param_sets: Arc::new(RwLock::new(None)),
-            param_notify: Arc::new(Notify::new()),
-            demand_count: Arc::new(AtomicUsize::new(0)),
-            demand_tx,
-            play_count: Arc::new(AtomicUsize::new(0)),
+    /// Binds a multi-stream RTSP server on `bind_addr`, returning handles keyed by normalized path.
+    pub async fn bind_streams(
+        bind_addr: SocketAddr,
+        auth: Option<RtspAuthConfig>,
+        specs: Vec<RtspStreamSpec>,
+    ) -> Result<(Self, SocketAddr, HashMap<String, RtspStreamHandle>), NvrDeskError> {
+        if specs.is_empty() {
+            return Err(NvrDeskError::Rtsp(
+                "at least one RTSP stream is required".into(),
+            ));
+        }
+
+        let listener = TcpListener::bind(bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        let mut streams = HashMap::new();
+        let mut handles = HashMap::new();
+
+        for spec in specs {
+            let norm_path = normalize_stream_path(&spec.path);
+            let entry = StreamEntry::new(norm_path.clone(), spec.name);
+            handles.insert(
+                norm_path.clone(),
+                RtspStreamHandle {
+                    entry: Arc::clone(&entry),
+                },
+            );
+            streams.insert(norm_path, Arc::clone(&entry));
+            for alias in spec.aliases {
+                let norm_alias = normalize_stream_path(&alias);
+                streams
+                    .entry(norm_alias)
+                    .or_insert_with(|| Arc::clone(&entry));
+            }
+        }
+
+        let state = ServerState {
+            streams: Arc::new(streams),
+            auth,
             next_session_id: Arc::new(AtomicU64::new(1000)),
         };
 
-        let handle = RtspStreamHandle {
-            state: state.clone(),
-        };
-
-        Ok((Self { listener, state }, local_addr, handle))
+        Ok((Self { listener, state }, local_addr, handles))
     }
 
     /// Runs the RTSP accept loop until the task is cancelled or encounters a fatal accept error.
     pub async fn serve(self) -> Result<(), NvrDeskError> {
-        info!(addr = %self.listener.local_addr()?, path = %self.state.stream_path, "RTSP server listening");
+        let addr = self.listener.local_addr()?;
+        let mut paths: Vec<&str> = self.state.streams.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        info!(%addr, ?paths, auth_enabled = self.state.auth.is_some(), "RTSP server listening");
         loop {
             let (stream, peer_addr) = self.listener.accept().await?;
             let state = self.state.clone();
@@ -189,6 +272,8 @@ enum ClientTransport {
 struct SessionState {
     id: String,
     ssrc: u32,
+    nonce: String,
+    stream: Option<Arc<StreamEntry>>,
     transport: Option<ClientTransport>,
     playing: bool,
     awaiting_keyframe: bool,
@@ -199,7 +284,7 @@ struct SessionState {
 async fn handle_client(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    state: SharedStreamState,
+    state: ServerState,
 ) -> Result<(), NvrDeskError> {
     let local_ip = stream
         .local_addr()
@@ -211,6 +296,8 @@ async fn handle_client(
     let mut session = SessionState {
         id: format!("{session_num:08X}"),
         ssrc: (session_num as u32) ^ 0x4E56_5244,
+        nonce: Uuid::new_v4().simple().to_string(),
+        stream: None,
         transport: None,
         playing: false,
         awaiting_keyframe: true,
@@ -219,13 +306,15 @@ async fn handle_client(
     };
 
     let mut packetizer = H264RtpPacketizer::new(session.ssrc);
-    let mut frame_rx = state.frame_tx.subscribe();
+    let mut frame_rx: Option<broadcast::Receiver<Arc<EncodedFrame>>> = None;
     let mut read_buf = BytesMut::with_capacity(8192);
 
     debug!(%peer_addr, session = %session.id, "RTSP client connected");
 
     loop {
-        if session.playing {
+        if session.playing
+            && let Some(rx) = frame_rx.as_mut()
+        {
             tokio::select! {
                 read_res = stream.read_buf(&mut read_buf) => {
                     let n = read_res?;
@@ -245,7 +334,7 @@ async fn handle_client(
                         return Ok(());
                     }
                 }
-                recv_res = frame_rx.recv() => {
+                recv_res = rx.recv() => {
                     match recv_res {
                         Ok(frame) => {
                             if session.awaiting_keyframe {
@@ -262,7 +351,7 @@ async fn handle_client(
                             ).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!(%peer_addr, skipped, "RTSP client lagged behind video stream; waiting for next keyframe");
+                            warn!(%peer_addr, skipped, "RTSP client lagged; waiting for next keyframe");
                             session.awaiting_keyframe = true;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -298,9 +387,9 @@ async fn process_read_buffer(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     local_ip: &str,
-    state: &SharedStreamState,
+    state: &ServerState,
     session: &mut SessionState,
-    frame_rx: &mut broadcast::Receiver<Arc<EncodedFrame>>,
+    frame_rx: &mut Option<broadcast::Receiver<Arc<EncodedFrame>>>,
     packetizer: &H264RtpPacketizer,
 ) -> Result<bool, NvrDeskError> {
     loop {
@@ -348,9 +437,9 @@ async fn handle_request(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     local_ip: &str,
-    state: &SharedStreamState,
+    state: &ServerState,
     session: &mut SessionState,
-    frame_rx: &mut broadcast::Receiver<Arc<EncodedFrame>>,
+    frame_rx: &mut Option<broadcast::Receiver<Arc<EncodedFrame>>>,
     packetizer: &H264RtpPacketizer,
 ) -> Result<bool, NvrDeskError> {
     let cseq = req
@@ -365,33 +454,52 @@ async fn handle_request(
 
     debug!(%peer_addr, method = ?req.method(), path = %uri_path, %cseq, "RTSP request");
 
+    if !matches!(req.method(), Method::Options)
+        && let Some(auth) = &state.auth
+    {
+        let method_name = method_as_str(req.method());
+        let authorized = req.header(&headers::AUTHORIZATION).is_some_and(|hdr| {
+            auth.verify_authorization(hdr.as_str(), method_name, &session.nonce)
+        });
+        if !authorized {
+            let resp = Response::builder(Version::V1_0, StatusCode::Unauthorized)
+                .header(headers::CSEQ, cseq)
+                .header(
+                    headers::WWW_AUTHENTICATE,
+                    RtspAuthConfig::challenge_header(&session.nonce),
+                )
+                .empty();
+            write_rtsp_response(stream, &resp).await?;
+            return Ok(true);
+        }
+    }
+
     match req.method() {
         Method::Options => {
             let resp = Response::builder(Version::V1_0, StatusCode::Ok)
                 .header(headers::CSEQ, cseq)
                 .header(
                     headers::PUBLIC,
-                    "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN",
+                    "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER, TEARDOWN",
                 )
                 .empty();
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Describe => {
-            if uri_path != state.stream_path {
+            let Some(entry) = state.resolve_stream(&uri_path).cloned() else {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
-            }
+            };
 
-            // Ensure SPS/PPS are available for SDP by momentarily requesting capture if needed.
-            let (sps, pps) = ensure_parameter_sets(state).await;
-            let sdp = build_h264_sdp(local_ip, &state.stream_name, sps.as_deref(), pps.as_deref());
+            let (sps, pps) = ensure_parameter_sets(&entry).await;
+            let sdp = build_h264_sdp(local_ip, &entry.stream_name, sps.as_deref(), pps.as_deref());
             let content_base = req
                 .request_uri()
                 .map(|u| format!("{}/", u.as_str().trim_end_matches('/')))
-                .unwrap_or_else(|| format!("rtsp://{local_ip}{}/", state.stream_path));
+                .unwrap_or_else(|| format!("rtsp://{local_ip}{}/", entry.stream_path));
 
             let resp = Response::builder(Version::V1_0, StatusCode::Ok)
                 .header(headers::CSEQ, cseq)
@@ -401,13 +509,13 @@ async fn handle_request(
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Setup => {
-            if !matches_stream_or_track(&uri_path, &state.stream_path) {
+            let Some(entry) = state.resolve_stream(&uri_path).cloned() else {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
-            }
+            };
 
             let transport_reply = setup_transport(&req, peer_addr, session).await?;
             let Some(reply_header) = transport_reply else {
@@ -418,6 +526,8 @@ async fn handle_request(
                 return Ok(true);
             };
 
+            session.stream = Some(entry);
+
             let resp = Response::builder(Version::V1_0, StatusCode::Ok)
                 .header(headers::CSEQ, cseq)
                 .header(headers::TRANSPORT, reply_header)
@@ -426,6 +536,13 @@ async fn handle_request(
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Play => {
+            let Some(entry) = session.stream.clone() else {
+                let resp = Response::builder(Version::V1_0, StatusCode::MethodNotValidInThisState)
+                    .header(headers::CSEQ, cseq)
+                    .empty();
+                write_rtsp_response(stream, &resp).await?;
+                return Ok(true);
+            };
             if session.transport.is_none() {
                 let resp = Response::builder(Version::V1_0, StatusCode::MethodNotValidInThisState)
                     .header(headers::CSEQ, cseq)
@@ -435,21 +552,21 @@ async fn handle_request(
             }
 
             if !session.playing {
-                session._demand_guard = Some(state.add_demand());
-                let prev = state.play_count.fetch_add(1, Ordering::AcqRel);
+                session._demand_guard = Some(entry.add_demand());
+                let prev = entry.play_count.fetch_add(1, Ordering::AcqRel);
                 session._play_guard = Some(PlayGuard {
-                    count: Arc::clone(&state.play_count),
+                    count: Arc::clone(&entry.play_count),
                 });
                 session.playing = true;
                 session.awaiting_keyframe = true;
-                *frame_rx = state.frame_tx.subscribe();
-                info!(%peer_addr, session = %session.id, active_players = prev + 1, "RTSP client started PLAY");
+                *frame_rx = Some(entry.frame_tx.subscribe());
+                info!(%peer_addr, path = %entry.stream_path, session = %session.id, active_players = prev + 1, "RTSP client started PLAY");
             }
 
             let base_uri = req
                 .request_uri()
                 .map(|u| u.as_str().trim_end_matches('/').to_string())
-                .unwrap_or_else(|| format!("rtsp://{local_ip}{}", state.stream_path));
+                .unwrap_or_else(|| format!("rtsp://{local_ip}{}", entry.stream_path));
 
             let rtp_info = format!(
                 "url={base_uri}/trackID=0;seq={}",
@@ -464,7 +581,17 @@ async fn handle_request(
                 .empty();
             write_rtsp_response(stream, &resp).await?;
         }
-        Method::GetParameter => {
+        Method::Pause => {
+            session.playing = false;
+            session._play_guard.take();
+            session._demand_guard.take();
+            let resp = Response::builder(Version::V1_0, StatusCode::Ok)
+                .header(headers::CSEQ, cseq)
+                .header(headers::SESSION, session.id.as_str())
+                .empty();
+            write_rtsp_response(stream, &resp).await?;
+        }
+        Method::GetParameter | Method::SetParameter => {
             let resp = Response::builder(Version::V1_0, StatusCode::Ok)
                 .header(headers::CSEQ, cseq)
                 .header(headers::SESSION, session.id.as_str())
@@ -493,22 +620,22 @@ async fn handle_request(
     Ok(true)
 }
 
-async fn ensure_parameter_sets(state: &SharedStreamState) -> (Option<Bytes>, Option<Bytes>) {
-    if let Some((sps, pps)) = state.param_sets.read().expect("param_sets lock").clone() {
+async fn ensure_parameter_sets(entry: &StreamEntry) -> (Option<Bytes>, Option<Bytes>) {
+    if let Some((sps, pps)) = entry.param_sets.read().expect("param_sets lock").clone() {
         return (Some(sps), Some(pps));
     }
 
     // Wake capture+encoder temporarily until the first keyframe produces SPS/PPS.
-    let _guard = state.add_demand();
+    let _guard = entry.add_demand();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     loop {
-        if let Some((sps, pps)) = state.param_sets.read().expect("param_sets lock").clone() {
+        if let Some((sps, pps)) = entry.param_sets.read().expect("param_sets lock").clone() {
             return (Some(sps), Some(pps));
         }
         if tokio::time::Instant::now() >= deadline {
             return (None, None);
         }
-        let _ = tokio::time::timeout_at(deadline, state.param_notify.notified()).await;
+        let _ = tokio::time::timeout_at(deadline, entry.param_notify.notified()).await;
     }
 }
 
@@ -613,7 +740,23 @@ async fn write_rtsp_response<B: AsRef<[u8]>>(
     Ok(())
 }
 
-fn normalize_stream_path(path: &str) -> String {
+fn method_as_str(method: &Method) -> &str {
+    match method {
+        Method::Options => "OPTIONS",
+        Method::Describe => "DESCRIBE",
+        Method::Setup => "SETUP",
+        Method::Play => "PLAY",
+        Method::Pause => "PAUSE",
+        Method::GetParameter => "GET_PARAMETER",
+        Method::SetParameter => "SET_PARAMETER",
+        Method::Teardown => "TEARDOWN",
+        _ => "",
+    }
+}
+
+/// Normalizes an RTSP stream path to always start with `/` and omit trailing slashes.
+#[must_use]
+pub fn normalize_stream_path(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
@@ -624,24 +767,13 @@ fn normalize_stream_path(path: &str) -> String {
     }
 }
 
-fn matches_stream_or_track(uri_path: &str, stream_path: &str) -> bool {
-    if uri_path == stream_path {
-        return true;
-    }
-    let prefix = format!("{stream_path}/");
-    uri_path.starts_with(&prefix)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_paths_and_track_ids() {
-        assert_eq!(normalize_stream_path("/stream/"), "/stream");
-        assert_eq!(normalize_stream_path("stream"), "/stream");
-        assert!(matches_stream_or_track("/stream", "/stream"));
-        assert!(matches_stream_or_track("/stream/trackID=0", "/stream"));
-        assert!(!matches_stream_or_track("/other", "/stream"));
+    fn normalizes_paths() {
+        assert_eq!(normalize_stream_path("/stream1/"), "/stream1");
+        assert_eq!(normalize_stream_path("stream2"), "/stream2");
     }
 }
