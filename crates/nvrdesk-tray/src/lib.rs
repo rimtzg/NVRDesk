@@ -270,6 +270,7 @@ fn run_linux_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn wait_for_shutdown(shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
