@@ -14,7 +14,6 @@ confinement: strict
 apps:
   nvrdesk:
     command: bin/nvrdesk
-    desktop: snap/gui/nvrdesk.desktop
     plugs:
       - network
       - network-bind
