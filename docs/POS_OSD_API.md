@@ -1,48 +1,48 @@
-# API de OSD Dinámico y Máscaras de Privacidad para POS
+# POS Dynamic OSD & Privacy Masks API
 
-NVRDesk expone una API local **HTTP REST** y **WebSocket** para que cualquier software TPV / POS (o middleware de caja) inyecte información en tiempo real sobre el video grabado por el NVR/VMS: número de ticket, cajero activo, artículos escaneados, apertura de cajón, anulaciones o alertas de supervisor.
+NVRDesk exposes a local **HTTP REST** and **WebSocket** API so any POS / retail checkout application (or middleware) can inject real-time overlay text onto video recorded by the NVR/VMS: ticket numbers, active cashier, scanned items, cash drawer opens, voids, or supervisor alerts.
 
-Cada línea inyectada se renderiza simultáneamente en **MainStream**, **SubStream** y los **snapshots HTTP / MJPEG**, y opcionalmente emite eventos ONVIF `PullPointSubscription` para disparar alertas o marcadores de grabación en el NVR.
-
----
-
-## URL Base y Requisitos
-
-- **HTTP:** `http://<host>:8080` (puerto configurable vía `--http-port` o `[onvif].http_port`)
-- **HTTPS / WSS:** `https://<host>:8080` y `wss://<host>:8080` (cuando `--https` o `[tls].https_enabled = true`)
-- **Requisito:** La Web UI / servidor HTTP embebido debe estar habilitado (`daemon.web_ui_enabled = true`, valor por defecto; no uses `--no-web-ui`).
+Each injected line renders simultaneously on **MainStream**, **SubStream**, and **HTTP / MJPEG snapshots**, and can optionally emit ONVIF `PullPointSubscription` events to trigger NVR recording bookmarks or alerts.
 
 ---
 
-## Endpoints HTTP REST
+## Base URL & Prerequisites
 
-### 1. Inyectar o actualizar texto OSD (`POST /api/v1/osd/text`)
+- **HTTP:** `http://<host>:8080` (port configurable via `--http-port` or `[onvif].http_port`)
+- **HTTPS / WSS:** `https://<host>:8080` and `wss://<host>:8080` (when `--https` or `[tls].https_enabled = true`)
+- **Prerequisite:** The embedded Web UI / HTTP server must remain enabled (`daemon.web_ui_enabled = true`, default; do not pass `--no-web-ui`).
 
-Crea o reemplaza una línea OSD identificada por `slot`. Pueden coexistir múltiples `slot` visibles al mismo tiempo (ordenados alfabéticamente por nombre de `slot`).
+---
 
-- **Método y ruta:** `POST /api/v1/osd/text`
+## HTTP REST Endpoints
+
+### 1. Inject or Update OSD Text (`POST /api/v1/osd/text`)
+
+Creates or replaces an OSD line identified by `slot`. Multiple visible `slot` entries can coexist simultaneously (sorted alphabetically by `slot` name).
+
+- **Method & Path:** `POST /api/v1/osd/text`
 - **Headers:** `Content-Type: application/json`
 
-#### Campos del body JSON
+#### JSON Body Fields
 
-| Campo | Tipo | Obligatorio | Default | Descripción |
+| Field | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `text` | `string` | Sí (salvo `action="clear"`) | `""` | Texto a mostrar en pantalla. Si llega vacío (o solo espacios), elimina ese `slot`. |
-| `slot` | `string` | No | `"ticket"` | Identificador lógico de la línea (ej. `"cashier"`, `"ticket"`, `"drawer"`). |
-| `level` | `"info" \| "warning" \| "alert"` | No | `"info"` | Severidad visual: acento azul (`info`), ámbar (`warning`) o rojo (`alert`). |
-| `ttl_ms` | `integer` (`u64`) | No | `pos.default_ttl_ms` (`8000`) | Tiempo de vida en ms antes de desaparecer automáticamente. **`0` = fijo (sticky)** hasta borrarlo. |
-| `emit_event` | `boolean` | No | `false` | Si es `true` y `text` no está vacío, publica un evento ONVIF `tns1:RuleEngine/PosEvent/Alert`. |
-| `action` | `"clear"` | No | `null` | Si vale `"clear"`, limpia el `slot` indicado (o todos si se omite `slot`). |
+| `text` | `string` | Yes (unless `action="clear"`) | `""` | Text displayed on screen. Sending empty text (or whitespace only) clears that `slot`. |
+| `slot` | `string` | No | `"ticket"` | Logical identifier for the line (e.g. `"cashier"`, `"ticket"`, `"drawer"`). |
+| `level` | `"info" \| "warning" \| "alert"` | No | `"info"` | Visual severity: blue accent (`info`), amber (`warning`), or red (`alert`). |
+| `ttl_ms` | `integer` (`u64`) | No | `pos.default_ttl_ms` (`8000`) | Time-to-live in milliseconds before auto-expiring. **`0` = sticky** until explicitly cleared. |
+| `emit_event` | `boolean` | No | `false` | When `true` and `text` is non-empty, publishes an ONVIF `tns1:RuleEngine/PosEvent/Alert` event. |
+| `action` | `"clear"` | No | `null` | When `"clear"`, clears the specified `slot` (or all slots if `slot` is omitted). |
 
-#### Respuesta (`200 OK`)
+#### Response (`200 OK`)
 
-Devuelve un arreglo JSON con las líneas activas actualmente:
+Returns a JSON array with currently active OSD lines:
 
 ```json
 [
   {
     "slot": "ticket",
-    "text": "Ticket #4821 | Cajero: Ana | Total: $349.50",
+    "text": "Ticket #4821 | Cashier: Ana | Total: $349.50",
     "level": "warning"
   }
 ]
@@ -50,9 +50,9 @@ Devuelve un arreglo JSON con las líneas activas actualmente:
 
 ---
 
-### 2. Consultar líneas activas (`GET /api/v1/osd/text`)
+### 2. List Active OSD Lines (`GET /api/v1/osd/text`)
 
-Lista las líneas OSD activas no expiradas.
+Returns all non-expired active OSD lines.
 
 ```bash
 curl http://127.0.0.1:8080/api/v1/osd/text
@@ -60,9 +60,9 @@ curl http://127.0.0.1:8080/api/v1/osd/text
 
 ---
 
-### 3. Limpiar un slot específico (`DELETE /api/v1/osd/text/{slot}`)
+### 3. Clear a Specific Slot (`DELETE /api/v1/osd/text/{slot}`)
 
-Elimina únicamente el `slot` indicado. Devuelve `204 No Content`.
+Removes only the specified `slot`. Returns `204 No Content`.
 
 ```bash
 curl -X DELETE http://127.0.0.1:8080/api/v1/osd/text/drawer
@@ -70,9 +70,9 @@ curl -X DELETE http://127.0.0.1:8080/api/v1/osd/text/drawer
 
 ---
 
-### 4. Limpiar todas las líneas (`DELETE /api/v1/osd/text`)
+### 4. Clear All Lines (`DELETE /api/v1/osd/text`)
 
-Limpia todos los slots activos de inmediato. Devuelve `204 No Content`.
+Immediately clears all active OSD slots. Returns `204 No Content`.
 
 ```bash
 curl -X DELETE http://127.0.0.1:8080/api/v1/osd/text
@@ -80,9 +80,9 @@ curl -X DELETE http://127.0.0.1:8080/api/v1/osd/text
 
 ---
 
-### 5. Consultar eventos recientes (`GET /api/v1/events`)
+### 5. Query Recent Events (`GET /api/v1/events`)
 
-Devuelve hasta los últimos `25` eventos almacenados en el `EventBroker` (incluyendo `tns1:RuleEngine/PosEvent/Alert` y `tns1:VideoSource/MotionAlarm`).
+Returns up to the latest `25` events recorded in `EventBroker` (including `tns1:RuleEngine/PosEvent/Alert` and `tns1:VideoSource/MotionAlarm`).
 
 ```json
 [
@@ -93,29 +93,29 @@ Devuelve hasta los últimos `25` eventos almacenados en el `EventBroker` (incluy
     "source_name": "Slot",
     "source_value": "drawer",
     "data_name": "Message",
-    "data_value": "alert: CAJON ABIERTO SIN VENTA"
+    "data_value": "alert: MANUAL DRAWER OPEN WITHOUT SALE"
   }
 ]
 ```
 
 ---
 
-## API WebSocket (`GET /api/v1/ws/osd`)
+## WebSocket API (`GET /api/v1/ws/osd`)
 
-Ideal para puntos de venta que actualizan el ticket en cada producto escaneado sin abrir una conexión HTTP por petición.
+Ideal for POS software updating the ticket on every scanned barcode without opening a new HTTP connection per item.
 
-- **URL:** `ws://127.0.0.1:8080/api/v1/ws/osd` (o `wss://` si `--https` está activo)
-- **Mensajes entrantes (cliente -> NVRDesk):** Texto JSON con el mismo esquema de `POST /api/v1/osd/text`.
-- **Mensajes salientes (NVRDesk -> cliente):** JSON con el arreglo actualizado de `PosOsdLine` activas.
+- **URL:** `ws://127.0.0.1:8080/api/v1/ws/osd` (or `wss://` when `--https` is active)
+- **Incoming messages (client -> NVRDesk):** JSON text following the same schema as `POST /api/v1/osd/text`.
+- **Outgoing messages (NVRDesk -> client):** JSON array with updated active `PosOsdLine` entries.
 
-Ejemplo de payloads por WebSocket:
+Example WebSocket payloads:
 
 ```json
-{"slot":"cashier","text":"Caja 01 | Turno Matutino | Luis M.","level":"info","ttl_ms":0}
+{"slot":"cashier","text":"POS 01 | Morning Shift | Luis M.","level":"info","ttl_ms":0}
 ```
 
 ```json
-{"slot":"ticket","text":"SKU 75010553 | Refresco 600ml | $22.00","level":"info","ttl_ms":10000}
+{"slot":"ticket","text":"SKU 75010553 | Soda 600ml | $22.00","level":"info","ttl_ms":10000}
 ```
 
 ```json
@@ -124,21 +124,21 @@ Ejemplo de payloads por WebSocket:
 
 ---
 
-## Integración con Eventos ONVIF (`PullPointSubscription`)
+## ONVIF Event Integration (`PullPointSubscription`)
 
-Cuando se envía `"emit_event": true` junto con un `text` no vacío:
+When `"emit_event": true` is sent alongside non-empty `text`:
 
-1. NVRDesk publica el evento en `EventBroker` bajo el tópico ONVIF:
+1. NVRDesk publishes the event into `EventBroker` under the ONVIF topic:
    - **Topic:** `tns1:RuleEngine/PosEvent/Alert`
    - **Source:** `Name="Slot" Value="<slot>"`
    - **Data:** `Name="Message" Value="<level>: <text>"`
-2. Cualquier NVR/VMS suscrito a `/onvif/events_service` vía `CreatePullPointSubscription` + `PullMessages` recibe el `<wsnt:NotificationMessage>` en tiempo real.
+2. Any NVR/VMS subscribed to `/onvif/events_service` via `CreatePullPointSubscription` + `PullMessages` receives the `<wsnt:NotificationMessage>` in real time.
 
 ---
 
-## Configuración `[pos]` y Máscaras de Privacidad Fijas
+## `[pos]` Configuration & Static Privacy Masks
 
-En `nvrdesk.toml` (o mediante `PUT /api/v1/config` / Web UI):
+In `nvrdesk.toml` (or via `PUT /api/v1/config` / Web UI interactive Privacy Masks editor):
 
 ```toml
 [pos]
@@ -154,31 +154,31 @@ height = 0.16
 label = "PIN PAD"
 ```
 
-### Reglas de coordenadas en `privacy_masks`
-- Todos los valores (`x`, `y`, `width`, `height`) son **normalizados de `0.0` a `1.0`** respecto al tamaño del frame de salida, por lo que cubren exactamente la misma región de pantalla tanto en `MainStream` (1080p), `SubStream` (360p) y snapshots HTTP.
-- Las máscaras se dibujan como rectángulos opacos (`#0F172A`, con `label` opcional si el área mide al menos ~2 caracteres x 22 px) **antes** de componer el OSD POS, overlays de teclas/clics y codificar video/JPEG.
+### Coordinate Rules for `privacy_masks`
+- All coordinates (`x`, `y`, `width`, `height`) are **normalized from `0.0` to `1.0`** relative to the output frame dimensions, so they cover the exact same screen region across `MainStream` (1080p), `SubStream` (360p), and HTTP snapshots.
+- Masks are drawn as opaque dark rectangles (`#0F172A`, with optional `label` if the box is at least ~2 characters x 22 px) **before** composing POS OSD, keystroke/click overlays, and encoding video or JPEG snapshots.
 
 ---
 
-## Ejemplos de Uso
+## Code Examples
 
 ### Bash (`curl`)
 
 ```bash
-# 1) Mostrar cajero fijo (ttl_ms = 0)
+# 1) Display sticky cashier banner (ttl_ms = 0)
 curl -X POST http://127.0.0.1:8080/api/v1/osd/text \
   -H "Content-Type: application/json" \
-  -d '{"slot":"cashier","text":"Caja 02 | Operador: Ana P.","level":"info","ttl_ms":0}'
+  -d '{"slot":"cashier","text":"Register 02 | Operator: Ana P.","level":"info","ttl_ms":0}'
 
-# 2) Notificar cobro temporal (8 segundos por defecto)
+# 2) Post temporary checkout line (default 8 seconds)
 curl -X POST http://127.0.0.1:8080/api/v1/osd/text \
   -H "Content-Type: application/json" \
-  -d '{"slot":"ticket","text":"Ticket #4821 | Total: $349.50 | Tarjeta","level":"info"}'
+  -d '{"slot":"ticket","text":"Ticket #4821 | Total: $349.50 | Card","level":"info"}'
 
-# 3) Alertar apertura manual de cajón y disparar evento ONVIF
+# 3) Alert manual cash drawer open and emit ONVIF event
 curl -X POST http://127.0.0.1:8080/api/v1/osd/text \
   -H "Content-Type: application/json" \
-  -d '{"slot":"drawer","text":"APERTURA MANUAL DE CAJON","level":"alert","ttl_ms":12000,"emit_event":true}'
+  -d '{"slot":"drawer","text":"MANUAL DRAWER OPEN","level":"alert","ttl_ms":12000,"emit_event":true}'
 ```
 
 ### Python (`requests`)
@@ -222,7 +222,7 @@ if __name__ == "__main__":
     send_pos_osd(
         "http://127.0.0.1:8080",
         slot="ticket",
-        text="Ticket #4822 | Cancelacion parcial -$85.00",
+        text="Ticket #4822 | Partial void -$85.00",
         level="warning",
         ttl_ms=10000,
         emit_event=True,
@@ -249,7 +249,7 @@ function connectPosOsdSocket(wsUrl) {
   ws.addEventListener("open", () => {
     ws.send(JSON.stringify({
       slot: "ticket",
-      text: "Ticket #9012 | Escaneando articulos...",
+      text: "Ticket #9012 | Scanning items...",
       level: "info",
       ttl_ms: 8000,
     }));
