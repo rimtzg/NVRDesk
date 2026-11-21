@@ -189,6 +189,166 @@ input, select, textarea {
 .tab-panel { display: none; }
 .tab-panel.active { display: grid; }
 
+.masks-launcher {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 8, 13, 0.78);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 1000;
+}
+.modal-backdrop.open { display: flex; }
+.modal-dialog {
+  width: min(1060px, 100%);
+  max-height: 92vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-header, .modal-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-footer {
+  border-bottom: 0;
+  border-top: 1px solid var(--border);
+  justify-content: flex-end;
+  gap: 10px;
+}
+.modal-header h3 { margin: 0; font-size: 1rem; }
+.modal-body {
+  display: grid;
+  grid-template-columns: 1.65fr 1fr;
+  gap: 14px;
+  padding: 14px 16px;
+  overflow-y: auto;
+}
+.masks-stage {
+  position: relative;
+  background: #080b10;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  user-select: none;
+  touch-action: none;
+}
+.masks-stage img {
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  display: block;
+  pointer-events: none;
+}
+.masks-overlay {
+  position: absolute;
+  inset: 0;
+  cursor: crosshair;
+}
+.mask-box {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.72);
+  border: 2px solid rgba(148, 163, 184, 0.85);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: move;
+  overflow: visible;
+}
+.mask-box.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.5);
+}
+.mask-box-label {
+  pointer-events: none;
+  padding: 2px 5px;
+  background: rgba(15, 20, 28, 0.75);
+  border-radius: 4px;
+  max-width: 90%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mask-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--accent);
+  border: 1.5px solid #fff;
+  border-radius: 2px;
+}
+.mask-handle[data-dir="nw"] { top: -5px; left: -5px; cursor: nwse-resize; }
+.mask-handle[data-dir="n"]  { top: -5px; left: calc(50% - 5px); cursor: ns-resize; }
+.mask-handle[data-dir="ne"] { top: -5px; right: -5px; cursor: nesw-resize; }
+.mask-handle[data-dir="e"]  { top: calc(50% - 5px); right: -5px; cursor: ew-resize; }
+.mask-handle[data-dir="se"] { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.mask-handle[data-dir="s"]  { bottom: -5px; left: calc(50% - 5px); cursor: ns-resize; }
+.mask-handle[data-dir="sw"] { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.mask-handle[data-dir="w"]  { top: calc(50% - 5px); left: -5px; cursor: ew-resize; }
+
+.masks-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.masks-sidebar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.masks-sidebar-head span { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+.masks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.mask-item {
+  background: #101620;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+.mask-item.selected { border-color: var(--accent); }
+.mask-item-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mask-item-row input {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 0.8rem;
+}
+.mask-coords { font-size: 0.72rem; color: var(--muted); }
+.btn-danger { background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 5px 8px; font-size: 0.78rem; }
+
+@media (max-width: 860px) {
+  .modal-body { grid-template-columns: 1fr; }
+}
+
 .btn {
   border: 0;
   border-radius: 7px;
