@@ -1,4 +1,8 @@
 let currentConfig = null;
+let privacyMasksState = [];
+let draftMasks = [];
+let selectedMaskIdx = -1;
+let dragOp = null;
 
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts);
@@ -85,9 +89,10 @@ async function loadInitial() {
   document.getElementById("cfg-motion-enabled").checked = cfg.motion ? cfg.motion.enabled : true;
   document.getElementById("cfg-https-enabled").checked = cfg.tls ? cfg.tls.https_enabled : false;
   document.getElementById("cfg-rtsps-enabled").checked = cfg.tls ? cfg.tls.rtsps_enabled : false;
-  document.getElementById("cfg-privacy-masks").value = JSON.stringify(
-    (cfg.pos && cfg.pos.privacy_masks) ? cfg.pos.privacy_masks : []
-  );
+  privacyMasksState = Array.isArray(cfg.pos && cfg.pos.privacy_masks)
+    ? structuredClone(cfg.pos.privacy_masks)
+    : [];
+  updateMasksSummary();
 
   document.getElementById("cfg-srt-enabled").checked = cfg.srt ? cfg.srt.enabled : false;
   document.getElementById("cfg-srt-mode").value = cfg.srt ? cfg.srt.mode : "caller";
@@ -193,15 +198,7 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   updated.tls.https_enabled = document.getElementById("cfg-https-enabled").checked;
   updated.tls.rtsps_enabled = document.getElementById("cfg-rtsps-enabled").checked;
   updated.pos = updated.pos || {};
-  try {
-    const parsedMasks = JSON.parse(document.getElementById("cfg-privacy-masks").value || "[]");
-    if (Array.isArray(parsedMasks)) {
-      updated.pos.privacy_masks = parsedMasks;
-    }
-  } catch (maskErr) {
-    document.getElementById("save-msg").textContent = `Invalid Privacy Masks JSON: ${maskErr.message}`;
-    return;
-  }
+  updated.pos.privacy_masks = structuredClone(privacyMasksState);
 
   updated.srt = updated.srt || {};
   updated.srt.enabled = document.getElementById("cfg-srt-enabled").checked;
@@ -257,6 +254,236 @@ document.getElementById("clear-osd-btn").addEventListener("click", async () => {
   await fetch("/api/v1/osd/text", { method: "DELETE" });
   document.getElementById("osd-text-input").value = "";
   await refreshStatus();
+});
+
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    const panel = document.getElementById(btn.dataset.tab);
+    if (panel) panel.classList.add("active");
+  });
+});
+
+function clamp01(val) {
+  return Math.max(0, Math.min(1, val));
+}
+
+function round3(val) {
+  return Math.round(val * 1000) / 1000;
+}
+
+function updateMasksSummary() {
+  const el = document.getElementById("masks-summary");
+  if (!el) return;
+  const count = privacyMasksState.length;
+  el.textContent = count === 0
+    ? "No masks configured"
+    : `${count} mask${count === 1 ? "" : "s"} configured (click Save & Apply to persist)`;
+}
+
+function openMasksModal() {
+  draftMasks = structuredClone(privacyMasksState);
+  selectedMaskIdx = draftMasks.length > 0 ? 0 : -1;
+  document.getElementById("masks-preview-img").src = `/preview/main.mjpeg?t=${Date.now()}`;
+  const modal = document.getElementById("masks-modal");
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+  renderMasksEditor();
+}
+
+function closeMasksModal() {
+  const modal = document.getElementById("masks-modal");
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+  document.getElementById("masks-preview-img").src = "";
+  dragOp = null;
+}
+
+function renderMasksEditor() {
+  const overlay = document.getElementById("masks-overlay");
+  const list = document.getElementById("masks-list");
+  overlay.innerHTML = "";
+  list.innerHTML = "";
+
+  draftMasks.forEach((m, idx) => {
+    const isSelected = idx === selectedMaskIdx;
+    const box = document.createElement("div");
+    box.className = `mask-box${isSelected ? " selected" : ""}`;
+    box.style.left = `${m.x * 100}%`;
+    box.style.top = `${m.y * 100}%`;
+    box.style.width = `${m.width * 100}%`;
+    box.style.height = `${m.height * 100}%`;
+    box.dataset.idx = String(idx);
+
+    const lbl = document.createElement("span");
+    lbl.className = "mask-box-label";
+    lbl.textContent = m.label || `Mask #${idx + 1}`;
+    box.appendChild(lbl);
+
+    if (isSelected) {
+      ["nw", "n", "ne", "e", "se", "s", "sw", "w"].forEach((dir) => {
+        const h = document.createElement("div");
+        h.className = "mask-handle";
+        h.dataset.dir = dir;
+        h.dataset.idx = String(idx);
+        box.appendChild(h);
+      });
+    }
+    overlay.appendChild(box);
+
+    const item = document.createElement("div");
+    item.className = `mask-item${isSelected ? " selected" : ""}`;
+    item.addEventListener("click", () => {
+      selectedMaskIdx = idx;
+      renderMasksEditor();
+    });
+
+    const row = document.createElement("div");
+    row.className = "mask-item-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = `Mask #${idx + 1} label`;
+    input.value = m.label || "";
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("input", (e) => {
+      draftMasks[idx].label = e.target.value;
+      lbl.textContent = e.target.value || `Mask #${idx + 1}`;
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn btn-danger";
+    delBtn.textContent = "Delete";
+    delBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      draftMasks.splice(idx, 1);
+      if (selectedMaskIdx >= draftMasks.length) {
+        selectedMaskIdx = draftMasks.length - 1;
+      }
+      renderMasksEditor();
+    });
+    row.appendChild(input);
+    row.appendChild(delBtn);
+
+    const coords = document.createElement("div");
+    coords.className = "mask-coords";
+    coords.textContent = `x: ${m.x.toFixed(2)}, y: ${m.y.toFixed(2)} | ${Math.round(m.width * 100)}% x ${Math.round(m.height * 100)}%`;
+
+    item.appendChild(row);
+    item.appendChild(coords);
+    list.appendChild(item);
+  });
+
+  if (draftMasks.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "field-hint";
+    empty.textContent = "No masks yet. Click '+ Add Mask' or drag on the preview.";
+    list.appendChild(empty);
+  }
+}
+
+function getNormCoords(evt) {
+  const rect = document.getElementById("masks-overlay").getBoundingClientRect();
+  return {
+    nx: clamp01((evt.clientX - rect.left) / rect.width),
+    ny: clamp01((evt.clientY - rect.top) / rect.height),
+  };
+}
+
+document.getElementById("masks-overlay").addEventListener("pointerdown", (e) => {
+  const { nx, ny } = getNormCoords(e);
+  if (e.target.classList.contains("mask-handle")) {
+    const idx = Number(e.target.dataset.idx);
+    selectedMaskIdx = idx;
+    dragOp = {
+      type: "resize",
+      dir: e.target.dataset.dir,
+      idx,
+      startX: nx,
+      startY: ny,
+      orig: { ...draftMasks[idx] },
+    };
+  } else if (e.target.classList.contains("mask-box")) {
+    const idx = Number(e.target.dataset.idx);
+    selectedMaskIdx = idx;
+    dragOp = {
+      type: "move",
+      idx,
+      startX: nx,
+      startY: ny,
+      orig: { ...draftMasks[idx] },
+    };
+    renderMasksEditor();
+  } else {
+    const newMask = { x: round3(nx), y: round3(ny), width: 0.02, height: 0.02, label: "MASK" };
+    draftMasks.push(newMask);
+    selectedMaskIdx = draftMasks.length - 1;
+    dragOp = { type: "draw", idx: selectedMaskIdx, startX: nx, startY: ny };
+    renderMasksEditor();
+  }
+  e.target.setPointerCapture?.(e.pointerId);
+});
+
+window.addEventListener("pointermove", (e) => {
+  if (!dragOp) return;
+  const { nx, ny } = getNormCoords(e);
+  const m = draftMasks[dragOp.idx];
+  if (!m) return;
+  const minSize = 0.02;
+
+  if (dragOp.type === "draw") {
+    const x0 = Math.min(dragOp.startX, nx);
+    const y0 = Math.min(dragOp.startY, ny);
+    m.x = round3(x0);
+    m.y = round3(y0);
+    m.width = round3(Math.max(minSize, Math.abs(nx - dragOp.startX)));
+    m.height = round3(Math.max(minSize, Math.abs(ny - dragOp.startY)));
+  } else if (dragOp.type === "move") {
+    const dx = nx - dragOp.startX;
+    const dy = ny - dragOp.startY;
+    m.x = round3(Math.max(0, Math.min(1 - dragOp.orig.width, dragOp.orig.x + dx)));
+    m.y = round3(Math.max(0, Math.min(1 - dragOp.orig.height, dragOp.orig.y + dy)));
+  } else if (dragOp.type === "resize") {
+    const o = dragOp.orig;
+    let left = o.x;
+    let top = o.y;
+    let right = o.x + o.width;
+    let bottom = o.y + o.height;
+    if (dragOp.dir.includes("w")) left = Math.min(right - minSize, nx);
+    if (dragOp.dir.includes("e")) right = Math.max(left + minSize, nx);
+    if (dragOp.dir.includes("n")) top = Math.min(bottom - minSize, ny);
+    if (dragOp.dir.includes("s")) bottom = Math.max(top + minSize, ny);
+    m.x = round3(left);
+    m.y = round3(top);
+    m.width = round3(right - left);
+    m.height = round3(bottom - top);
+  }
+  renderMasksEditor();
+});
+
+window.addEventListener("pointerup", () => {
+  dragOp = null;
+});
+
+document.getElementById("open-masks-modal-btn").addEventListener("click", openMasksModal);
+document.getElementById("cancel-masks-btn").addEventListener("click", closeMasksModal);
+document.getElementById("add-mask-btn").addEventListener("click", () => {
+  draftMasks.push({
+    x: 0.35,
+    y: 0.35,
+    width: 0.28,
+    height: 0.22,
+    label: `PIN-${draftMasks.length + 1}`,
+  });
+  selectedMaskIdx = draftMasks.length - 1;
+  renderMasksEditor();
+});
+document.getElementById("apply-masks-btn").addEventListener("click", () => {
+  privacyMasksState = structuredClone(draftMasks);
+  updateMasksSummary();
+  closeMasksModal();
 });
 
 document.getElementById("apply-template-btn").addEventListener("click", async () => {
