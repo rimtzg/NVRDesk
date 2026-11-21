@@ -1,0 +1,72 @@
+name: Snapcraft Store Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Target Snapcraft Store channel'
+        required: true
+        type: choice
+        default: candidate
+        options:
+          - edge
+          - beta
+          - candidate
+          - stable
+      publish:
+        description: 'Upload and release to Snapcraft Store'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build Snap (core24 amd64)
+    runs-on: ubuntu-latest
+    outputs:
+      snap: ${{ steps.snapcraft.outputs.snap }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build snap package
+        id: snapcraft
+        uses: snapcore/action-build@v1
+
+      - name: Upload .snap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvrdesk-snap
+          path: ${{ steps.snapcraft.outputs.snap }}
+
+  publish:
+    name: Publish to Snapcraft Store
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built .snap artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nvrdesk-snap
+          path: .
+
+      - name: Resolve target channel
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "channel=edge" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=${{ inputs.channel }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish snap to Snap Store
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPSTORE_TOKEN }}
+        with:
+          snap: ${{ needs.build.outputs.snap }}
+          release: ${{ steps.target.outputs.channel }}

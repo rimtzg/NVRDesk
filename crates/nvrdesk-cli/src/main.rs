@@ -335,6 +335,11 @@ fn main() -> Result<()> {
         return handle_fleet_command(action);
     }
 
+    let config_path = cli
+        .config
+        .clone()
+        .or_else(nvrdesk_core::default_snap_config_path);
+
     let mut cfg = if let Some(template_name) = &cli.template {
         build_template_config(
             template_name,
@@ -344,7 +349,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
         )?
-    } else if let Some(path) = &cli.config {
+    } else if let Some(path) = &config_path {
         if path.exists() {
             NvrDeskConfig::from_toml_file(path)?
         } else {
@@ -377,7 +382,6 @@ fn main() -> Result<()> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let use_tray_loop = !cli.no_tray;
-    let config_path = cli.config.clone();
 
     if use_tray_loop {
         // Run Tokio on a background thread so the OS main thread is free for the System Tray loop.

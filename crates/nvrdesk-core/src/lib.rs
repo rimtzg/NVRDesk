@@ -526,11 +526,50 @@ pub struct RecordingConfig {
     pub max_total_mb: u64,
 }
 
+/// Resolves the default ring-buffer recording directory, using `$SNAP_USER_COMMON` /
+/// `$SNAP_USER_DATA` when running inside a confined Snap package.
+#[must_use]
+pub fn resolve_snap_recordings_dir(
+    snap_user_common: Option<&str>,
+    snap_user_data: Option<&str>,
+) -> PathBuf {
+    snap_user_common
+        .or(snap_user_data)
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(
+            || PathBuf::from("./recordings"),
+            |dir| PathBuf::from(dir).join("recordings"),
+        )
+}
+
+/// Returns the default recordings directory for the current runtime environment.
+#[must_use]
+pub fn default_recordings_dir() -> PathBuf {
+    let common = std::env::var("SNAP_USER_COMMON").ok();
+    let data = std::env::var("SNAP_USER_DATA").ok();
+    resolve_snap_recordings_dir(common.as_deref(), data.as_deref())
+}
+
+/// Resolves an automatic writable `nvrdesk.toml` path when running inside a Snap package.
+#[must_use]
+pub fn resolve_snap_config_path(snap_user_data: Option<&str>) -> Option<PathBuf> {
+    snap_user_data
+        .filter(|s| !s.trim().is_empty())
+        .map(|dir| PathBuf::from(dir).join("nvrdesk.toml"))
+}
+
+/// Returns a persistent configuration file path inside `$SNAP_USER_DATA`, if running as a Snap.
+#[must_use]
+pub fn default_snap_config_path() -> Option<PathBuf> {
+    let data = std::env::var("SNAP_USER_DATA").ok();
+    resolve_snap_config_path(data.as_deref())
+}
+
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            directory: PathBuf::from("./recordings"),
+            directory: default_recordings_dir(),
             segment_secs: 300,
             max_total_mb: 1024,
         }
@@ -881,5 +920,26 @@ mod tests {
         assert_eq!(parsed.sub_stream.path, "/stream2");
         assert_eq!(parsed.onvif.http_port, 8080);
         assert!(!parsed.input_overlay.show_cursor_highlight);
+    }
+
+    #[test]
+    fn snap_paths_resolve_to_snap_user_dirs_when_set() {
+        assert_eq!(
+            resolve_snap_recordings_dir(Some("/home/pos/snap/nvrdesk/common"), None),
+            PathBuf::from("/home/pos/snap/nvrdesk/common/recordings")
+        );
+        assert_eq!(
+            resolve_snap_recordings_dir(None, Some("/home/pos/snap/nvrdesk/12")),
+            PathBuf::from("/home/pos/snap/nvrdesk/12/recordings")
+        );
+        assert_eq!(
+            resolve_snap_recordings_dir(None, None),
+            PathBuf::from("./recordings")
+        );
+        assert_eq!(
+            resolve_snap_config_path(Some("/home/pos/snap/nvrdesk/12")),
+            Some(PathBuf::from("/home/pos/snap/nvrdesk/12/nvrdesk.toml"))
+        );
+        assert_eq!(resolve_snap_config_path(None), None);
     }
 }
