@@ -41,7 +41,7 @@ jobs:
 
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
-        run: choco install ffmpeg wixtoolset -y
+        run: choco install ffmpeg -y
 
       - name: Build release binary
         run: cargo build --release -p nvrdesk-cli
@@ -67,9 +67,23 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/nvrdesk.exe -DestinationPath dist/nvrdesk-${{ matrix.target }}.zip -Force
-          cargo install cargo-wix --locked
-          cargo wix --package nvrdesk-cli --init --force
-          cargo wix --package nvrdesk-cli --no-build --output dist/
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            $wixRoot = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+            if ($wixRoot) {
+              $env:WIX = "$($wixRoot.FullName)\"
+              $env:PATH = "$(Join-Path $wixRoot.FullName 'bin');$env:PATH"
+            } else {
+              choco install wixtoolset --version=3.14.1 -y
+              $wixRoot = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+              if ($wixRoot) {
+                $env:WIX = "$($wixRoot.FullName)\"
+                $env:PATH = "$(Join-Path $wixRoot.FullName 'bin');$env:PATH"
+              }
+            }
+          }
+          cargo install cargo-wix --version 0.3.9 --locked
+          cargo wix init --package nvrdesk-cli --force --product-name "NVRDesk" --description "NVRDesk ONVIF/RTSP virtual IP camera and screen recorder" crates/nvrdesk-cli/Cargo.toml
+          cargo wix --package nvrdesk-cli --no-build --nocapture --name NVRDesk --output dist/ crates/nvrdesk-cli/Cargo.toml
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
