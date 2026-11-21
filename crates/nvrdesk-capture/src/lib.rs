@@ -133,6 +133,43 @@ fn select_monitor(display_index: usize) -> Result<Monitor, NvrDeskError> {
         .ok_or_else(|| NvrDeskError::Capture("display index out of range".into()))
 }
 
+fn monitor_bounds(monitor: &Monitor) -> Option<MonitorBounds> {
+    match (monitor.x(), monitor.y(), monitor.width(), monitor.height()) {
+        (Ok(x), Ok(y), Ok(width), Ok(height)) if width > 0 && height > 0 => Some(MonitorBounds {
+            x,
+            y,
+            width,
+            height,
+        }),
+        _ => None,
+    }
+}
+
+/// Captures a single desktop frame without starting a continuous `VideoRecorder` session.
+///
+/// Ideal for idle HTTP snapshots and Web UI MJPEG preview frames.
+pub fn capture_single_screen_frame(
+    display_index: usize,
+) -> Result<(RawVideoFrame, Option<MonitorBounds>), NvrDeskError> {
+    let monitor = select_monitor(display_index)?;
+    let bounds = monitor_bounds(&monitor);
+    let image = monitor
+        .capture_image()
+        .map_err(|e| map_xcap_error(&e.to_string()))?;
+    let width = image.width();
+    let height = image.height();
+    let stride = (width as usize) * 4;
+    let frame = RawVideoFrame {
+        width,
+        height,
+        stride,
+        format: PixelFormat::Rgba8,
+        timestamp_us: 0,
+        data: image.into_raw(),
+    };
+    Ok((frame, bounds))
+}
+
 impl CaptureSource for ScreenCaptureSource {
     fn name(&self) -> &str {
         &self.name
@@ -168,17 +205,7 @@ impl CaptureSource for ScreenCaptureSource {
                 let monitor_name = monitor
                     .name()
                     .unwrap_or_else(|_| format!("screen:{display_index}"));
-                let bounds = match (monitor.x(), monitor.y(), monitor.width(), monitor.height()) {
-                    (Ok(x), Ok(y), Ok(width), Ok(height)) if width > 0 && height > 0 => {
-                        Some(MonitorBounds {
-                            x,
-                            y,
-                            width,
-                            height,
-                        })
-                    }
-                    _ => None,
-                };
+                let bounds = monitor_bounds(&monitor);
                 let (recorder, raw_rx) = match monitor.video_recorder() {
                     Ok(pair) => pair,
                     Err(err) => {

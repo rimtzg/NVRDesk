@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use nvrdesk_capture::{
     AudioCaptureSource, CaptureSource, ScreenCaptureSource, TestPatternSource, WebcamCaptureSource,
-    focused_window_title,
+    capture_single_screen_frame, focused_window_title,
 };
 use nvrdesk_codec::{VideoEncoder, audio::encode_g711, create_video_encoder};
 use nvrdesk_core::{
@@ -173,6 +173,8 @@ impl SnapshotProvider for LiveSnapshotProvider {
         let (raw, bounds) = if let Some(frame) = cached {
             let bounds = *self.latest_bounds.read().expect("latest_bounds lock");
             (frame, bounds)
+        } else if cfg.source.kind == CaptureSourceKind::Screen {
+            capture_single_screen_frame(cfg.source.display)?
         } else {
             let mut src = build_screen_source(
                 cfg.source.kind,
@@ -883,6 +885,7 @@ fn run_worker(
 
         if screen_started {
             screen_src.stop();
+            *latest_frame.write().expect("latest_frame lock") = None;
         }
         if let Some(mut cam) = webcam_src {
             cam.stop();
