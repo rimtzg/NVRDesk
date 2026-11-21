@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NVRDesk — Open-Source ONVIF / RTSP / SRT Virtual IP Camera</title>
+  <meta name="description" content="Turn POS terminals and desktops into lightweight ONVIF Profile S/T, RTSP/RTSPS, and SRT virtual IP cameras with visual click/keystroke auditing and privacy masks." />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="nav-wrap">
+    <nav class="nav container">
+      <a class="brand" href="#">
+        <img src="./icon.svg" alt="NVRDesk Logo" width="34" height="34" />
+        <span>NVRDesk</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#install">Download</a>
+        <a href="#vms">Compatibility</a>
+        <a href="./docs/">Docs</a>
+        <a class="nav-cta" href="https://github.com/rimtzg/NVRDesk" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero container">
+      <div class="pill" id="release-pill">Latest Release: v0.4.0 &middot; MIT License</div>
+      <h1>Virtual ONVIF / RTSP / SRT IP Camera for POS &amp; Desktops</h1>
+      <p class="lead">
+        Ultra-lightweight Rust alternative to ITVDesk / DeskCamera. Stream desktops, webcams, microphones,
+        and operator activity overlays directly to Hikvision, Dahua, Milestone, Frigate, and Synology.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#install">Download Installers</a>
+        <a class="btn btn-secondary" href="./docs/">Read Documentation</a>
+        <a class="btn btn-ghost" href="https://github.com/rimtzg/NVRDesk" target="_blank" rel="noopener">Source on GitHub</a>
+      </div>
+      <div class="quick-cmd">
+        <code>sudo snap install nvrdesk --edge</code>
+        <button id="copy-snap-btn" type="button" class="btn-copy">Copy</button>
+      </div>
+    </section>
+
+    <section id="features" class="container section">
+      <h2>Built for 24/7 POS Auditing &amp; Standard VMS</h2>
+      <div class="cards-grid">
+        <article class="card">
+          <h3>POS Activity Overlays</h3>
+          <p>Animated click ripples, borderless keystroke OSD with PCI digit masking, and live POS ticket text via REST &amp; WebSocket.</p>
+        </article>
+        <article class="card">
+          <h3>Visual Privacy Masks</h3>
+          <p>Draw and resize normalized blackout rectangles directly over the live Web UI preview to protect PIN pads and card fields.</p>
+        </article>
+        <article class="card">
+          <h3>ONVIF Profile S &amp; T</h3>
+          <p>WS-Discovery auto-discovery, WS-Security auth, H.264 &amp; H.265 <code>Media2</code>, PullPoint Motion/POS events, and HTTP JPEG snapshots.</p>
+        </article>
+        <article class="card">
+          <h3>Webcam, Mic &amp; Talkback</h3>
+          <p>Optional webcam PiP or dedicated <code>/webcam</code> RTSP channel, G.711 PCMU/PCMA audio, and two-way NVR-to-POS backchannel.</p>
+        </article>
+        <article class="card">
+          <h3>Pure-Rust SRT WAN Push</h3>
+          <p>Stream encrypted MPEG-TS over SRT across CG-NAT/LTE to central cloud VMS relays without external C++ <code>libsrt</code> deps.</p>
+        </article>
+        <article class="card">
+          <h3>Zero-Idle &amp; Fleet CLI</h3>
+          <p>Pauses encoding near 0% CPU when idle. Deploy across POS fleets via <code>nvrdesk fleet init</code>, Ansible, GPO PowerShell, or Snap.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="install" class="container section">
+      <h2>Install &amp; Download</h2>
+      <p class="section-sub">Choose your operating system installer from GitHub Releases or Ubuntu Snapcraft Store.</p>
+      <div class="download-grid" id="download-grid">
+        <a class="dl-card" id="dl-win" href="https://github.com/rimtzg/NVRDesk/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-os">Windows (x86_64)</span>
+          <strong>.MSI Installer / .ZIP</strong>
+          <span class="dl-note">Includes GPO silent deployment script</span>
+        </a>
+        <a class="dl-card" id="dl-deb" href="https://github.com/rimtzg/NVRDesk/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-os">Ubuntu / Debian</span>
+          <strong>.DEB / Snap Store</strong>
+          <span class="dl-note">Tested on Ubuntu 24.04 LTS</span>
+        </a>
+        <a class="dl-card" id="dl-mac" href="https://github.com/rimtzg/NVRDesk/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-os">macOS (Apple Silicon)</span>
+          <strong>.DMG Disk Image</strong>
+          <span class="dl-note">Run <code>xattr -cr</code> if Gatekeeper prompts</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="vms" class="container section">
+      <h2>Validated NVR &amp; VMS Targets</h2>
+      <div class="badges-row">
+        <span>Hikvision</span>
+        <span>Dahua</span>
+        <span>Uniview</span>
+        <span>Milestone XProtect</span>
+        <span>Nx Witness</span>
+        <span>Frigate NVR</span>
+        <span>Shinobi</span>
+        <span>Synology Surveillance</span>
+      </div>
+      <p class="compat-link">
+        See configuration guides and quirks in the <a href="./docs/COMPATIBILITY_MATRIX.html">Compatibility Matrix</a>.
+      </p>
+    </section>
+  </main>
+
+  <footer class="footer container">
+    <span>NVRDesk &middot; MIT Licensed &middot; Created by <a href="https://github.com/rimtzg" target="_blank" rel="noopener">rimtzg</a></span>
+    <div class="footer-links">
+      <a href="./docs/">Docs</a>
+      <a href="./docs/POS_OSD_API.html">POS API</a>
+      <a href="./docs/FLEET_DEPLOYMENT.html">Fleet &amp; SRT</a>
+      <a href="https://github.com/rimtzg/NVRDesk/releases" target="_blank" rel="noopener">Releases</a>
+    </div>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>
