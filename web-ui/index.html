@@ -87,176 +87,235 @@
           <h2>Configuration</h2>
           <button id="save-cfg-btn" class="btn btn-primary">Save &amp; Apply</button>
         </div>
-        <form id="cfg-form" class="form-grid">
-          <label>
-            Video Source
-            <select id="cfg-source-kind">
-              <option value="screen">Desktop Screen</option>
-              <option value="test_pattern">Test Pattern</option>
-              <option value="mp4">MP4 File (FFmpeg)</option>
-              <option value="mjpeg">Legacy MJPEG Camera</option>
-              <option value="rtmp">RTMP Stream</option>
-              <option value="rtsp_relay">Upstream RTSP Relay</option>
-              <option value="ffmpeg_uri">Generic FFmpeg URI</option>
-            </select>
-          </label>
-          <label>
-            Source URI / File Path
-            <input id="cfg-source-uri" type="text" placeholder="/path/demo.mp4 or http://cam/mjpg" />
-          </label>
-          <label>
-            Monitor
-            <select id="cfg-display"></select>
-          </label>
-          <label>
-            Main Codec (Profile S/T)
-            <select id="cfg-main-codec">
-              <option value="h264">H.264 / AVC (Profile S)</option>
-              <option value="h265">H.265 / HEVC (Profile T)</option>
-            </select>
-          </label>
-          <label>
-            Encoder Backend
-            <select id="cfg-encoder-backend">
-              <option value="auto">Auto (HW FFmpeg -&gt; OpenH264)</option>
-              <option value="openh264">OpenH264 (Built-in MIT)</option>
-              <option value="ffmpeg">External FFmpeg CLI</option>
-            </select>
-          </label>
-          <label>
-            Main FPS
-            <input id="cfg-main-fps" type="number" min="1" max="60" />
-          </label>
-          <label>
-            Main Bitrate (bps)
-            <input id="cfg-main-bitrate" type="number" min="100000" step="100000" />
-          </label>
-          <label>
-            Keystroke OSD Mode
-            <select id="cfg-keystroke-mode">
-              <option value="masked_digits">Masked Digits (PCI-safe)</option>
-              <option value="shortcuts_and_special">Shortcuts &amp; Special Keys</option>
-              <option value="all">All Keys</option>
-              <option value="off">Off</option>
-            </select>
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-show-clicks" type="checkbox" />
-            Show Mouse Click Ripples
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-tray-enabled" type="checkbox" />
-            Show System Tray Icon
-          </label>
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="tab-video">Video &amp; Source</button>
+          <button type="button" class="tab-btn" data-tab="tab-pos">POS &amp; Privacy</button>
+          <button type="button" class="tab-btn" data-tab="tab-media">Webcam &amp; Audio</button>
+          <button type="button" class="tab-btn" data-tab="tab-security">Recording &amp; TLS</button>
+          <button type="button" class="tab-btn" data-tab="tab-fleet">SRT &amp; Fleet</button>
+        </div>
+        <form id="cfg-form">
+          <div id="tab-video" class="form-grid tab-panel active">
+            <label>
+              Video Source
+              <select id="cfg-source-kind">
+                <option value="screen">Desktop Screen</option>
+                <option value="test_pattern">Test Pattern</option>
+                <option value="mp4">MP4 File (FFmpeg)</option>
+                <option value="mjpeg">Legacy MJPEG Camera</option>
+                <option value="rtmp">RTMP Stream</option>
+                <option value="rtsp_relay">Upstream RTSP Relay</option>
+                <option value="ffmpeg_uri">Generic FFmpeg URI</option>
+              </select>
+              <span class="field-hint">Selects live OS desktop, synthetic test pattern, or external FFmpeg media input.</span>
+            </label>
+            <label>
+              Source URI / File Path
+              <input id="cfg-source-uri" type="text" placeholder="/path/demo.mp4 or http://cam/mjpg" />
+              <span class="field-hint">Input path or stream URL required for MP4, MJPEG, RTMP, or RTSP relay sources.</span>
+            </label>
+            <label>
+              Monitor
+              <select id="cfg-display"></select>
+              <span class="field-hint">Target display to capture when Video Source is set to Desktop Screen.</span>
+            </label>
+            <label>
+              Main Codec (Profile S/T)
+              <select id="cfg-main-codec">
+                <option value="h264">H.264 / AVC (Profile S)</option>
+                <option value="h265">H.265 / HEVC (Profile T)</option>
+              </select>
+              <span class="field-hint">H.264 offers universal NVR support; H.265 requires FFmpeg/HW HEVC and Profile T.</span>
+            </label>
+            <label>
+              Encoder Backend
+              <select id="cfg-encoder-backend">
+                <option value="auto">Auto (HW FFmpeg -&gt; OpenH264)</option>
+                <option value="openh264">OpenH264 (Built-in MIT)</option>
+                <option value="ffmpeg">External FFmpeg CLI</option>
+              </select>
+              <span class="field-hint">Auto uses GPU hardware encoding via FFmpeg if available, falling back to OpenH264.</span>
+            </label>
+            <label>
+              Main FPS
+              <input id="cfg-main-fps" type="number" min="1" max="60" />
+              <span class="field-hint">Target frames per second for MainStream (/stream1). 10-15 FPS is ideal for POS.</span>
+            </label>
+            <label>
+              Main Bitrate (bps)
+              <input id="cfg-main-bitrate" type="number" min="100000" step="100000" />
+              <span class="field-hint">Target video bitrate in bits/sec (e.g. 2000000 = 2 Mbps).</span>
+            </label>
+          </div>
 
-          <hr class="divider" />
-
-          <label class="checkbox-row">
-            <input id="cfg-webcam-enabled" type="checkbox" />
-            Enable Webcam
-          </label>
-          <label>
-            Webcam Device
-            <select id="cfg-webcam-device"></select>
-          </label>
-          <label>
-            Webcam Mode
-            <select id="cfg-webcam-mode">
-              <option value="pip">Picture-in-Picture</option>
-              <option value="channel">Dedicated RTSP Channel (/webcam)</option>
-            </select>
-          </label>
-          <label>
-            PiP Corner
-            <select id="cfg-pip-pos">
-              <option value="top_right">Top Right</option>
-              <option value="top_left">Top Left</option>
-              <option value="bottom_right">Bottom Right</option>
-              <option value="bottom_left">Bottom Left</option>
-            </select>
-          </label>
-
-          <hr class="divider" />
-
-          <label class="checkbox-row">
-            <input id="cfg-audio-enabled" type="checkbox" />
-            Enable Microphone Audio
-          </label>
-          <label>
-            Microphone Device
-            <select id="cfg-audio-device"></select>
-          </label>
-          <label>
-            Audio Codec
-            <select id="cfg-audio-codec">
-              <option value="pcmu">G.711 PCMU (mu-law 8kHz)</option>
-              <option value="pcma">G.711 PCMA (A-law 8kHz)</option>
-            </select>
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-rec-enabled" type="checkbox" />
-            Enable Local Ring Recording
-          </label>
-          <label>
-            Recording Max Quota (MB)
-            <input id="cfg-rec-max-mb" type="number" min="64" step="64" />
-          </label>
-
-          <hr class="divider" />
-
-          <label class="checkbox-row">
-            <input id="cfg-motion-enabled" type="checkbox" />
-            Motion Detection ONVIF Events
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-backchannel-enabled" type="checkbox" />
-            Audio Backchannel (restart)
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-https-enabled" type="checkbox" />
-            HTTPS TLS (restart)
-          </label>
-          <label class="checkbox-row">
-            <input id="cfg-rtsps-enabled" type="checkbox" />
-            RTSPS TLS (restart)
-          </label>
-          <label class="full-span">
-            POS Privacy Masks JSON (normalized 0.0-1.0: [{"x":0.7,"y":0.8,"width":0.25,"height":0.15,"label":"PIN"}])
-            <textarea id="cfg-privacy-masks" rows="2"></textarea>
-          </label>
-
-          <hr class="divider" />
-
-          <label class="checkbox-row">
-            <input id="cfg-srt-enabled" type="checkbox" />
-            Enable SRT WAN Push
-          </label>
-          <label>
-            SRT Mode
-            <select id="cfg-srt-mode">
-              <option value="caller">Caller (push to remote VMS)</option>
-              <option value="listener">Listener (wait incoming)</option>
-            </select>
-          </label>
-          <label>
-            SRT Target (host:port)
-            <input id="cfg-srt-target" type="text" placeholder="vms.example.com:9000" />
-          </label>
-          <label>
-            SRT Latency (ms)
-            <input id="cfg-srt-latency" type="number" min="20" step="20" />
-          </label>
-          <label>
-            Fleet Site / Terminal ID
-            <input id="cfg-fleet-id" type="text" placeholder="store-01/pos-01" />
-          </label>
-          <label>
-            Fleet Template Quick-Apply
-            <div class="osd-actions">
-              <select id="fleet-template-select" class="select-sm"></select>
-              <button id="apply-template-btn" type="button" class="btn btn-secondary btn-sm">Apply</button>
+          <div id="tab-pos" class="form-grid tab-panel">
+            <label>
+              Keystroke OSD Mode
+              <select id="cfg-keystroke-mode">
+                <option value="masked_digits">Masked Digits (PCI-safe)</option>
+                <option value="shortcuts_and_special">Shortcuts &amp; Special Keys</option>
+                <option value="all">All Keys</option>
+                <option value="off">Off</option>
+              </select>
+              <span class="field-hint">Controls how typed keys are burned into video. Masked Digits hides card/PIN sequences.</span>
+            </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-show-clicks" type="checkbox" />
+                Show Mouse Click Ripples
+              </label>
+              <span class="field-hint">Draws animated yellow/blue rings on mouse clicks in Main and Sub streams.</span>
             </div>
-          </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-tray-enabled" type="checkbox" />
+                Show System Tray Icon
+              </label>
+              <span class="field-hint">Displays or hides the NVRDesk status icon in the OS menu bar / system tray.</span>
+            </div>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-motion-enabled" type="checkbox" />
+                Motion Detection ONVIF Events
+              </label>
+              <span class="field-hint">Publishes ONVIF PullPoint MotionAlarm events when screen or webcam activity changes.</span>
+            </div>
+            <label class="full-span">
+              POS Privacy Masks JSON
+              <textarea id="cfg-privacy-masks" rows="3"></textarea>
+              <span class="field-hint">Normalized 0.0-1.0 rectangles blacked out before encoding/snapshots, e.g. [{"x":0.7,"y":0.8,"width":0.25,"height":0.15,"label":"PIN"}].</span>
+            </label>
+          </div>
+
+          <div id="tab-media" class="form-grid tab-panel">
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-webcam-enabled" type="checkbox" />
+                Enable Webcam
+              </label>
+              <span class="field-hint">Activates USB/integrated camera capture for PiP overlay or dedicated RTSP channel.</span>
+            </div>
+            <label>
+              Webcam Device
+              <select id="cfg-webcam-device"></select>
+              <span class="field-hint">Selects which connected camera hardware device to capture.</span>
+            </label>
+            <label>
+              Webcam Mode
+              <select id="cfg-webcam-mode">
+                <option value="pip">Picture-in-Picture</option>
+                <option value="channel">Dedicated RTSP Channel (/webcam)</option>
+              </select>
+              <span class="field-hint">PiP composites the webcam onto the screen stream; Channel exposes a separate /webcam URI.</span>
+            </label>
+            <label>
+              PiP Corner
+              <select id="cfg-pip-pos">
+                <option value="top_right">Top Right</option>
+                <option value="top_left">Top Left</option>
+                <option value="bottom_right">Bottom Right</option>
+                <option value="bottom_left">Bottom Left</option>
+              </select>
+              <span class="field-hint">Screen corner where the webcam overlay is placed when Webcam Mode is PiP.</span>
+            </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-audio-enabled" type="checkbox" />
+                Enable Microphone Audio
+              </label>
+              <span class="field-hint">Streams live microphone audio as G.711 (trackID=1) alongside RTSP video.</span>
+            </div>
+            <label>
+              Microphone Device
+              <select id="cfg-audio-device"></select>
+              <span class="field-hint">Audio input device captured for RTSP audio streaming.</span>
+            </label>
+            <label>
+              Audio Codec
+              <select id="cfg-audio-codec">
+                <option value="pcmu">G.711 PCMU (mu-law 8kHz)</option>
+                <option value="pcma">G.711 PCMA (A-law 8kHz)</option>
+              </select>
+              <span class="field-hint">PCMU is standard for Hikvision/Dahua/Milestone; PCMA is common in European NVRs.</span>
+            </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-backchannel-enabled" type="checkbox" />
+                Audio Backchannel (restart)
+              </label>
+              <span class="field-hint">Allows the VMS/NVR to send two-way G.711 talkback audio to POS speakers.</span>
+            </div>
+          </div>
+
+          <div id="tab-security" class="form-grid tab-panel">
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-rec-enabled" type="checkbox" />
+                Enable Local Ring Recording
+              </label>
+              <span class="field-hint">Saves rotating H.264 backup segments locally on disk if network to NVR drops.</span>
+            </div>
+            <label>
+              Recording Max Quota (MB)
+              <input id="cfg-rec-max-mb" type="number" min="64" step="64" />
+              <span class="field-hint">Maximum disk space used by local ring-buffer recordings before oldest files are evicted.</span>
+            </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-https-enabled" type="checkbox" />
+                HTTPS TLS (restart)
+              </label>
+              <span class="field-hint">Encrypts the Web UI, REST/WS OSD API, and ONVIF SOAP endpoints using rustls.</span>
+            </div>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-rtsps-enabled" type="checkbox" />
+                RTSPS TLS (restart)
+              </label>
+              <span class="field-hint">Enables TLS-encrypted RTSP streaming on the configured RTSPS port (default 8322).</span>
+            </div>
+          </div>
+
+          <div id="tab-fleet" class="form-grid tab-panel">
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-srt-enabled" type="checkbox" />
+                Enable SRT WAN Push
+              </label>
+              <span class="field-hint">Streams MPEG-TS over SRT (pure Rust) for reliable WAN/cloud VMS delivery across NAT.</span>
+            </div>
+            <label>
+              SRT Mode
+              <select id="cfg-srt-mode">
+                <option value="caller">Caller (push to remote VMS)</option>
+                <option value="listener">Listener (wait incoming)</option>
+              </select>
+              <span class="field-hint">Caller dials out to a remote VMS; Listener waits for an incoming SRT connection.</span>
+            </label>
+            <label>
+              SRT Target (host:port)
+              <input id="cfg-srt-target" type="text" placeholder="vms.example.com:9000" />
+              <span class="field-hint">Remote destination (Caller) or local bind ip:port (Listener) for SRT packets.</span>
+            </label>
+            <label>
+              SRT Latency (ms)
+              <input id="cfg-srt-latency" type="number" min="20" step="20" />
+              <span class="field-hint">ARQ packet-loss recovery buffer in milliseconds (120-200 ms recommended for WAN).</span>
+            </label>
+            <label>
+              Fleet Site / Terminal ID
+              <input id="cfg-fleet-id" type="text" placeholder="store-01/pos-01" />
+              <span class="field-hint">Branch and register identifier used for fleet manifests and stable ONVIF UUIDs.</span>
+            </label>
+            <label>
+              Fleet Template Quick-Apply
+              <div class="osd-actions">
+                <select id="fleet-template-select" class="select-sm"></select>
+                <button id="apply-template-btn" type="button" class="btn btn-secondary btn-sm">Apply</button>
+              </div>
+              <span class="field-hint">Applies a preset POS/PCI/SRT profile immediately with hot-reload.</span>
+            </label>
+          </div>
         </form>
         <p id="save-msg" class="save-msg"></p>
       </section>

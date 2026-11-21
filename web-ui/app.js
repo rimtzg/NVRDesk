@@ -259,6 +259,16 @@ document.getElementById("clear-osd-btn").addEventListener("click", async () => {
   await refreshStatus();
 });
 
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    const panel = document.getElementById(btn.dataset.tab);
+    if (panel) panel.classList.add("active");
+  });
+});
+
 document.getElementById("apply-template-btn").addEventListener("click", async () => {
   const tpl = document.getElementById("fleet-template-select").value;
   const fleetRaw = document.getElementById("cfg-fleet-id").value.trim();
