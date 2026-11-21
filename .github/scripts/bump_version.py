@@ -38,7 +38,7 @@ def compute_next_version(base_ver: str, head_ver: str, labels_csv: str) -> str |
 
 
 def update_manifests(new_version: str) -> None:
-    """Updates Cargo.toml workspace version and macOS Info.plist bundle version."""
+    """Updates Cargo.toml, Cargo.lock workspace crates, and macOS Info.plist bundle version."""
     cargo_path = pathlib.Path("Cargo.toml")
     cargo_text = cargo_path.read_text(encoding="utf-8")
     updated_cargo = re.sub(
@@ -48,6 +48,16 @@ def update_manifests(new_version: str) -> None:
         count=1,
     )
     cargo_path.write_text(updated_cargo, encoding="utf-8")
+
+    lock_path = pathlib.Path("Cargo.lock")
+    if lock_path.exists():
+        lock_text = lock_path.read_text(encoding="utf-8")
+        updated_lock = re.sub(
+            r'(name = "nvrdesk-[^"]+"\s*\nversion = )"[^"]+"',
+            rf'\1"{new_version}"',
+            lock_text,
+        )
+        lock_path.write_text(updated_lock, encoding="utf-8")
 
     plist_path = pathlib.Path("packaging/macos/Info.plist")
     if plist_path.exists():

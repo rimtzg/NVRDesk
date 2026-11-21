@@ -21,9 +21,6 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Bump version if needed
         id: bump
         env:
@@ -36,7 +33,6 @@ jobs:
             echo "bumped=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          cargo update --workspace --offline
           echo "next_ver=$NEXT_VER" >> "$GITHUB_OUTPUT"
           echo "bumped=true" >> "$GITHUB_OUTPUT"
 
