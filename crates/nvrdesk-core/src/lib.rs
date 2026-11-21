@@ -1,6 +1,6 @@
-//! Core domain types, configuration schema, input overlay snapshots, and errors for NVRDesk.
+//! Core domain types, TOML configuration schema, overlay snapshots, and errors for NVRDesk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -134,6 +134,17 @@ pub struct EncodedFrame {
     pub pts_90khz: u64,
 }
 
+/// Encoded audio packet ready for RTP delivery.
+#[derive(Debug, Clone)]
+pub struct EncodedAudioFrame {
+    /// Encoded payload bytes (e.g. G.711 PCMU or PCMA).
+    pub data: Bytes,
+    /// Presentation timestamp on the audio RTP clock (e.g. 8000 Hz).
+    pub pts_clock: u32,
+    /// RTP payload type (`0` for PCMU, `8` for PCMA).
+    pub payload_type: u8,
+}
+
 /// Video stream encoding configuration parameters.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -234,6 +245,161 @@ pub enum CaptureSourceKind {
     Screen,
     /// Synthetic animated SMPTE-style test pattern (for headless testing).
     TestPattern,
+}
+
+/// Video encoder backend preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderBackendKind {
+    /// Try hardware-accelerated FFmpeg if installed, else OpenH264.
+    #[default]
+    Auto,
+    /// Pure MIT-clean software encoder (Cisco OpenH264).
+    Openh264,
+    /// External FFmpeg CLI pipe encoder (supports HW codecs and custom codecs).
+    Ffmpeg,
+}
+
+/// Encoder configuration in `nvrdesk.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EncoderConfig {
+    pub backend: EncoderBackendKind,
+    pub ffmpeg_path: String,
+    pub ffmpeg_codec: Option<String>,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self {
+            backend: EncoderBackendKind::Auto,
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffmpeg_codec: None,
+        }
+    }
+}
+
+/// Webcam integration mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebcamMode {
+    /// Composite webcam as Picture-in-Picture over the POS desktop.
+    #[default]
+    Pip,
+    /// Expose webcam as an independent RTSP/ONVIF stream (`/webcam`).
+    Channel,
+}
+
+/// Picture-in-Picture corner placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipPosition {
+    TopLeft,
+    #[default]
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Webcam configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebcamConfig {
+    pub enabled: bool,
+    pub device_index: usize,
+    pub mode: WebcamMode,
+    pub pip_position: PipPosition,
+    pub pip_scale: f32,
+    pub channel_path: String,
+    pub max_width: u32,
+    pub fps: u32,
+    pub bitrate_bps: u32,
+}
+
+impl Default for WebcamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_index: 0,
+            mode: WebcamMode::Pip,
+            pip_position: PipPosition::TopRight,
+            pip_scale: 0.22,
+            channel_path: "/webcam".to_string(),
+            max_width: 640,
+            fps: 10,
+            bitrate_bps: 600_000,
+        }
+    }
+}
+
+/// Audio codec for microphone streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCodecKind {
+    /// G.711 mu-law (8 kHz, RTP PT 0 — universal NVR compatibility).
+    #[default]
+    Pcmu,
+    /// G.711 A-law (8 kHz, RTP PT 8).
+    Pcma,
+}
+
+/// Microphone audio configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub device_name: Option<String>,
+    pub codec: AudioCodecKind,
+    pub sample_rate: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_name: None,
+            codec: AudioCodecKind::Pcmu,
+            sample_rate: 8000,
+        }
+    }
+}
+
+/// Local ring-buffer recording configuration (resilience backup when NVR network drops).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingConfig {
+    pub enabled: bool,
+    pub directory: PathBuf,
+    pub segment_secs: u64,
+    pub max_total_mb: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("./recordings"),
+            segment_secs: 300,
+            max_total_mb: 1024,
+        }
+    }
+}
+
+/// Daemon / Web UI / System Tray configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    pub web_ui_enabled: bool,
+    pub tray_enabled: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            web_ui_enabled: true,
+            tray_enabled: true,
+        }
+    }
 }
 
 /// Source configuration in `nvrdesk.toml`.
@@ -387,8 +553,13 @@ impl Default for OnvifConfig {
 pub struct NvrDeskConfig {
     pub always_on: bool,
     pub source: SourceConfig,
+    pub encoder: EncoderConfig,
     pub main_stream: StreamProfileConfig,
     pub sub_stream: StreamProfileConfig,
+    pub webcam: WebcamConfig,
+    pub audio: AudioConfig,
+    pub recording: RecordingConfig,
+    pub daemon: DaemonConfig,
     pub input_overlay: InputOverlayConfig,
     pub rtsp: RtspConfig,
     pub onvif: OnvifConfig,
@@ -399,6 +570,7 @@ impl Default for NvrDeskConfig {
         Self {
             always_on: false,
             source: SourceConfig::default(),
+            encoder: EncoderConfig::default(),
             main_stream: StreamProfileConfig::default(),
             sub_stream: StreamProfileConfig {
                 enabled: true,
@@ -408,6 +580,10 @@ impl Default for NvrDeskConfig {
                 bitrate_bps: 450_000,
                 idr_interval_secs: 2,
             },
+            webcam: WebcamConfig::default(),
+            audio: AudioConfig::default(),
+            recording: RecordingConfig::default(),
+            daemon: DaemonConfig::default(),
             input_overlay: InputOverlayConfig::default(),
             rtsp: RtspConfig::default(),
             onvif: OnvifConfig::default(),
@@ -421,6 +597,36 @@ impl NvrDeskConfig {
         let content = std::fs::read_to_string(path)?;
         toml::from_str(&content).map_err(|e| NvrDeskError::Config(e.to_string()))
     }
+
+    /// Saves the configuration as pretty TOML to `path`.
+    pub fn save_toml_file(&self, path: &Path) -> Result<(), NvrDeskError> {
+        let content =
+            toml::to_string_pretty(self).map_err(|e| NvrDeskError::Config(e.to_string()))?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+/// Discovered capture device entry exposed by the REST API and Web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub index: usize,
+    pub name: String,
+    pub detail: String,
+    pub is_default: bool,
+}
+
+/// Full device inventory across monitors, webcams, and microphones.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceInventory {
+    pub monitors: Vec<DeviceEntry>,
+    pub webcams: Vec<DeviceEntry>,
+    pub microphones: Vec<DeviceEntry>,
 }
 
 /// Shared error type across NVRDesk crates.
@@ -485,5 +691,6 @@ mod tests {
         assert_eq!(parsed.main_stream.path, "/stream1");
         assert_eq!(parsed.sub_stream.path, "/stream2");
         assert_eq!(parsed.onvif.http_port, 8080);
+        assert!(!parsed.input_overlay.show_cursor_highlight);
     }
 }

@@ -40,6 +40,28 @@ pub struct OnvifServer {
     local_addr: SocketAddr,
 }
 
+/// Builds an Axum `Router` exposing ONVIF SOAP (`/onvif/*`) and JPEG snapshots (`/snapshot/{profile}`).
+pub fn build_onvif_router(
+    meta: OnvifDeviceMeta,
+    profiles: Vec<OnvifMediaProfile>,
+    auth: Option<OnvifAuthConfig>,
+    snapshots: Arc<dyn SnapshotProvider>,
+) -> Router {
+    let state = AppState {
+        meta,
+        profiles: Arc::new(RwLock::new(profiles)),
+        auth,
+        snapshots,
+    };
+
+    Router::new()
+        .route("/onvif/device_service", post(handle_soap))
+        .route("/onvif/media_service", post(handle_soap))
+        .route("/onvif/Media", post(handle_soap))
+        .route("/snapshot/{profile}", get(handle_snapshot))
+        .with_state(state)
+}
+
 impl OnvifServer {
     /// Binds the ONVIF HTTP server on `bind_addr`.
     pub async fn bind(
@@ -55,19 +77,7 @@ impl OnvifServer {
         let mut adjusted_meta = meta;
         adjusted_meta.http_port = local_addr.port();
 
-        let state = AppState {
-            meta: adjusted_meta,
-            profiles: Arc::new(RwLock::new(profiles)),
-            auth,
-            snapshots,
-        };
-
-        let app = Router::new()
-            .route("/onvif/device_service", post(handle_soap))
-            .route("/onvif/media_service", post(handle_soap))
-            .route("/onvif/Media", post(handle_soap))
-            .route("/snapshot/{profile}", get(handle_snapshot))
-            .with_state(state);
+        let app = build_onvif_router(adjusted_meta, profiles, auth, snapshots);
 
         Ok(Self {
             listener,

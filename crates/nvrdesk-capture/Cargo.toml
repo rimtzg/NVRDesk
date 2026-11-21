@@ -11,6 +11,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+cpal.workspace = true
+nokhwa.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 tracing.workspace = true
 xcap.workspace = true

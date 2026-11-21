@@ -1,4 +1,4 @@
-//! Async RTSP 1.0 server supporting multi-stream, Digest auth, TCP Interleaved, and UDP Unicast.
+//! Async RTSP 1.0 server supporting multi-stream, Digest auth, audio track, TCP & UDP.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use nvrdesk_core::{EncodedFrame, NvrDeskError};
+use nvrdesk_core::{AudioCodecKind, EncodedAudioFrame, EncodedFrame, NvrDeskError};
 use rtsp_types::{
     Message, Method, Request, Response, StatusCode, Version,
     headers::{self, RtpLowerTransport, Transports},
@@ -22,9 +22,13 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::{auth::RtspAuthConfig, rtp::H264RtpPacketizer, sdp::build_h264_sdp};
+use crate::{
+    audio_rtp::AudioRtpPacketizer, auth::RtspAuthConfig, rtp::H264RtpPacketizer,
+    sdp::build_stream_sdp,
+};
 
 const FRAME_BROADCAST_CAPACITY: usize = 64;
+const AUDIO_BROADCAST_CAPACITY: usize = 128;
 
 /// Configuration for a single-stream RTSP server (`RtspServer::bind`).
 #[derive(Debug, Clone)]
@@ -56,13 +60,17 @@ pub struct RtspStreamSpec {
     pub aliases: Vec<String>,
     /// SDP session name (`s=` line).
     pub name: String,
+    /// Optional G.711 audio codec advertised on `trackID=1`.
+    pub audio_codec: Option<AudioCodecKind>,
 }
 
 #[derive(Clone)]
 struct StreamEntry {
     stream_path: String,
     stream_name: String,
+    audio_codec: Option<AudioCodecKind>,
     frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
+    audio_tx: broadcast::Sender<Arc<EncodedAudioFrame>>,
     param_sets: Arc<RwLock<Option<(Bytes, Bytes)>>>,
     param_notify: Arc<Notify>,
     demand_count: Arc<AtomicUsize>,
@@ -72,13 +80,20 @@ struct StreamEntry {
 }
 
 impl StreamEntry {
-    fn new(stream_path: String, stream_name: String) -> Arc<Self> {
+    fn new(
+        stream_path: String,
+        stream_name: String,
+        audio_codec: Option<AudioCodecKind>,
+    ) -> Arc<Self> {
         let (frame_tx, _) = broadcast::channel(FRAME_BROADCAST_CAPACITY);
+        let (audio_tx, _) = broadcast::channel(AUDIO_BROADCAST_CAPACITY);
         let (demand_tx, _) = watch::channel(0usize);
         Arc::new(Self {
             stream_path,
             stream_name,
+            audio_codec,
             frame_tx,
+            audio_tx,
             param_sets: Arc::new(RwLock::new(None)),
             param_notify: Arc::new(Notify::new()),
             demand_count: Arc::new(AtomicUsize::new(0)),
@@ -106,13 +121,15 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn resolve_stream(&self, uri_path: &str) -> Option<&Arc<StreamEntry>> {
+    fn resolve_stream_and_track(&self, uri_path: &str) -> Option<(&Arc<StreamEntry>, Option<u8>)> {
         if let Some(exact) = self.streams.get(uri_path) {
-            return Some(exact);
+            return Some((exact, None));
         }
-        // Strip `/trackID=...` suffix for SETUP requests.
-        if let Some((base, _)) = uri_path.rsplit_once("/trackID=") {
-            return self.streams.get(base);
+        if let Some((base, track_str)) = uri_path.rsplit_once("/trackID=")
+            && let Some(entry) = self.streams.get(base)
+        {
+            let track_id = track_str.parse::<u8>().ok();
+            return Some((entry, track_id));
         }
         None
     }
@@ -140,7 +157,7 @@ impl Drop for PlayGuard {
     }
 }
 
-/// Handle used by an encoder loop to publish H.264 frames and monitor client demand.
+/// Handle used by an encoder loop to publish H.264/audio frames and monitor client demand.
 #[derive(Clone)]
 pub struct RtspStreamHandle {
     entry: Arc<StreamEntry>,
@@ -158,6 +175,11 @@ impl RtspStreamHandle {
             }
         }
         let _ = self.entry.frame_tx.send(Arc::new(frame));
+    }
+
+    /// Publishes an encoded G.711 audio packet to all playing RTSP clients subscribed to audio.
+    pub fn publish_audio(&self, frame: EncodedAudioFrame) {
+        let _ = self.entry.audio_tx.send(Arc::new(frame));
     }
 
     /// Returns a watch receiver carrying the number of clients demanding capture/encoding.
@@ -194,6 +216,7 @@ impl RtspServer {
             path: config.stream_path.clone(),
             aliases: Vec::new(),
             name: config.stream_name,
+            audio_codec: None,
         };
         let (server, addr, mut handles) =
             Self::bind_streams(config.bind_addr, None, vec![spec]).await?;
@@ -224,7 +247,7 @@ impl RtspServer {
 
         for spec in specs {
             let norm_path = normalize_stream_path(&spec.path);
-            let entry = StreamEntry::new(norm_path.clone(), spec.name);
+            let entry = StreamEntry::new(norm_path.clone(), spec.name, spec.audio_codec);
             handles.insert(
                 norm_path.clone(),
                 RtspStreamHandle {
@@ -279,10 +302,12 @@ enum ClientTransport {
 
 struct SessionState {
     id: String,
-    ssrc: u32,
+    video_ssrc: u32,
+    audio_ssrc: u32,
     nonce: String,
     stream: Option<Arc<StreamEntry>>,
-    transport: Option<ClientTransport>,
+    video_transport: Option<ClientTransport>,
+    audio_transport: Option<ClientTransport>,
     playing: bool,
     awaiting_keyframe: bool,
     _demand_guard: Option<DemandGuard>,
@@ -301,28 +326,35 @@ async fn handle_client(
     let _ = stream.set_nodelay(true);
 
     let session_num = state.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let video_ssrc = (session_num as u32) ^ 0x4E56_5244;
+    let audio_ssrc = video_ssrc ^ 0x00AA_5500;
     let mut session = SessionState {
         id: format!("{session_num:08X}"),
-        ssrc: (session_num as u32) ^ 0x4E56_5244,
+        video_ssrc,
+        audio_ssrc,
         nonce: Uuid::new_v4().simple().to_string(),
         stream: None,
-        transport: None,
+        video_transport: None,
+        audio_transport: None,
         playing: false,
         awaiting_keyframe: true,
         _demand_guard: None,
         _play_guard: None,
     };
 
-    let mut packetizer = H264RtpPacketizer::new(session.ssrc);
+    let mut video_packetizer = H264RtpPacketizer::new(video_ssrc);
+    let mut audio_packetizer = AudioRtpPacketizer::new(audio_ssrc);
     let mut frame_rx: Option<broadcast::Receiver<Arc<EncodedFrame>>> = None;
+    let mut audio_rx: Option<broadcast::Receiver<Arc<EncodedAudioFrame>>> = None;
     let mut read_buf = BytesMut::with_capacity(8192);
 
     debug!(%peer_addr, session = %session.id, "RTSP client connected");
 
     loop {
         if session.playing
-            && let Some(rx) = frame_rx.as_mut()
+            && let Some(v_rx) = frame_rx.as_mut()
         {
+            let has_audio = session.audio_transport.is_some();
             tokio::select! {
                 read_res = stream.read_buf(&mut read_buf) => {
                     let n = read_res?;
@@ -337,12 +369,13 @@ async fn handle_client(
                         &state,
                         &mut session,
                         &mut frame_rx,
-                        &packetizer,
+                        &mut audio_rx,
+                        &video_packetizer,
                     ).await? {
                         return Ok(());
                     }
                 }
-                recv_res = rx.recv() => {
+                recv_res = v_rx.recv() => {
                     match recv_res {
                         Ok(frame) => {
                             if session.awaiting_keyframe {
@@ -353,8 +386,8 @@ async fn handle_client(
                             }
                             send_encoded_frame(
                                 &mut stream,
-                                &mut session,
-                                &mut packetizer,
+                                &session.video_transport,
+                                &mut video_packetizer,
                                 &frame,
                             ).await?;
                         }
@@ -366,6 +399,20 @@ async fn handle_client(
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+                audio_res = async {
+                    if has_audio && let Some(a_rx) = audio_rx.as_mut() {
+                        a_rx.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Ok(audio_frame) = audio_res
+                        && !session.awaiting_keyframe
+                    {
+                        let pkt = audio_packetizer.packetize(&audio_frame);
+                        send_single_rtp(&mut stream, &session.audio_transport, &pkt).await?;
                     }
                 }
             }
@@ -382,7 +429,8 @@ async fn handle_client(
                 &state,
                 &mut session,
                 &mut frame_rx,
-                &packetizer,
+                &mut audio_rx,
+                &video_packetizer,
             )
             .await?
             {
@@ -401,6 +449,7 @@ async fn process_read_buffer(
     state: &ServerState,
     session: &mut SessionState,
     frame_rx: &mut Option<broadcast::Receiver<Arc<EncodedFrame>>>,
+    audio_rx: &mut Option<broadcast::Receiver<Arc<EncodedAudioFrame>>>,
     packetizer: &H264RtpPacketizer,
 ) -> Result<bool, NvrDeskError> {
     loop {
@@ -426,7 +475,8 @@ async fn process_read_buffer(
                 read_buf.advance(consumed);
                 if let Message::Request(req) = msg {
                     let keep_alive = handle_request(
-                        req, stream, peer_addr, local_ip, state, session, frame_rx, packetizer,
+                        req, stream, peer_addr, local_ip, state, session, frame_rx, audio_rx,
+                        packetizer,
                     )
                     .await?;
                     if !keep_alive {
@@ -451,6 +501,7 @@ async fn handle_request(
     state: &ServerState,
     session: &mut SessionState,
     frame_rx: &mut Option<broadcast::Receiver<Arc<EncodedFrame>>>,
+    audio_rx: &mut Option<broadcast::Receiver<Arc<EncodedAudioFrame>>>,
     packetizer: &H264RtpPacketizer,
 ) -> Result<bool, NvrDeskError> {
     let cseq = req
@@ -497,16 +548,23 @@ async fn handle_request(
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Describe => {
-            let Some(entry) = state.resolve_stream(&uri_path).cloned() else {
+            let Some((entry, _)) = state.resolve_stream_and_track(&uri_path) else {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
             };
+            let entry = Arc::clone(entry);
 
             let (sps, pps) = ensure_parameter_sets(&entry).await;
-            let sdp = build_h264_sdp(local_ip, &entry.stream_name, sps.as_deref(), pps.as_deref());
+            let sdp = build_stream_sdp(
+                local_ip,
+                &entry.stream_name,
+                sps.as_deref(),
+                pps.as_deref(),
+                entry.audio_codec,
+            );
             let content_base = req
                 .request_uri()
                 .map(|u| format!("{}/", u.as_str().trim_end_matches('/')))
@@ -520,16 +578,32 @@ async fn handle_request(
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Setup => {
-            let Some(entry) = state.resolve_stream(&uri_path).cloned() else {
+            let Some((entry_ref, track_id)) = state.resolve_stream_and_track(&uri_path) else {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
             };
+            let entry = Arc::clone(entry_ref);
 
-            let transport_reply = setup_transport(&req, peer_addr, session).await?;
-            let Some(reply_header) = transport_reply else {
+            let is_audio_track = track_id == Some(1);
+            if is_audio_track && entry.audio_codec.is_none() {
+                let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
+                    .header(headers::CSEQ, cseq)
+                    .empty();
+                write_rtsp_response(stream, &resp).await?;
+                return Ok(true);
+            }
+
+            let ssrc = if is_audio_track {
+                session.audio_ssrc
+            } else {
+                session.video_ssrc
+            };
+            let Some((client_transport, reply_header)) =
+                parse_setup_transport(&req, peer_addr, ssrc, is_audio_track).await?
+            else {
                 let resp = Response::builder(Version::V1_0, StatusCode::UnsupportedTransport)
                     .header(headers::CSEQ, cseq)
                     .empty();
@@ -537,6 +611,11 @@ async fn handle_request(
                 return Ok(true);
             };
 
+            if is_audio_track {
+                session.audio_transport = Some(client_transport);
+            } else {
+                session.video_transport = Some(client_transport);
+            }
             session.stream = Some(entry);
 
             let resp = Response::builder(Version::V1_0, StatusCode::Ok)
@@ -554,7 +633,7 @@ async fn handle_request(
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
             };
-            if session.transport.is_none() {
+            if session.video_transport.is_none() {
                 let resp = Response::builder(Version::V1_0, StatusCode::MethodNotValidInThisState)
                     .header(headers::CSEQ, cseq)
                     .empty();
@@ -572,7 +651,17 @@ async fn handle_request(
                 session.awaiting_keyframe = true;
                 entry.keyframe_requested.store(true, Ordering::Release);
                 *frame_rx = Some(entry.frame_tx.subscribe());
-                info!(%peer_addr, path = %entry.stream_path, session = %session.id, active_players = prev + 1, "RTSP client started PLAY");
+                if session.audio_transport.is_some() {
+                    *audio_rx = Some(entry.audio_tx.subscribe());
+                }
+                info!(
+                    %peer_addr,
+                    path = %entry.stream_path,
+                    session = %session.id,
+                    audio = session.audio_transport.is_some(),
+                    active_players = prev + 1,
+                    "RTSP client started PLAY"
+                );
             }
 
             let base_uri = req
@@ -637,7 +726,6 @@ async fn ensure_parameter_sets(entry: &StreamEntry) -> (Option<Bytes>, Option<By
         return (Some(sps), Some(pps));
     }
 
-    // Wake capture+encoder temporarily until the first keyframe produces SPS/PPS.
     let _guard = entry.add_demand();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     loop {
@@ -651,11 +739,12 @@ async fn ensure_parameter_sets(entry: &StreamEntry) -> (Option<Bytes>, Option<By
     }
 }
 
-async fn setup_transport(
+async fn parse_setup_transport(
     req: &Request<Vec<u8>>,
     peer_addr: SocketAddr,
-    session: &mut SessionState,
-) -> Result<Option<String>, NvrDeskError> {
+    ssrc: u32,
+    is_audio: bool,
+) -> Result<Option<(ClientTransport, String)>, NvrDeskError> {
     let Ok(Some(transports)) = req.typed_header::<Transports>() else {
         return Ok(None);
     };
@@ -668,17 +757,19 @@ async fn setup_transport(
         if matches!(rtp.lower_transport, Some(RtpLowerTransport::Tcp))
             || rtp.params.interleaved.is_some()
         {
+            let default_ch = if is_audio { (2, 3) } else { (0, 1) };
             let (rtp_ch, rtcp_ch) = match rtp.params.interleaved {
                 Some((a, Some(b))) => (a, b),
                 Some((a, None)) => (a, a.saturating_add(1)),
-                None => (0, 1),
+                None => default_ch,
             };
-            session.transport = Some(ClientTransport::TcpInterleaved {
-                rtp_channel: rtp_ch,
-            });
-            return Ok(Some(format!(
-                "RTP/AVP/TCP;unicast;interleaved={rtp_ch}-{rtcp_ch};ssrc={:08X}",
-                session.ssrc
+            let reply =
+                format!("RTP/AVP/TCP;unicast;interleaved={rtp_ch}-{rtcp_ch};ssrc={ssrc:08X}");
+            return Ok(Some((
+                ClientTransport::TcpInterleaved {
+                    rtp_channel: rtp_ch,
+                },
+                reply,
             )));
         }
 
@@ -693,14 +784,15 @@ async fn setup_transport(
             let server_rtcp_port = server_rtp_port.saturating_add(1);
             let rtp_dest = SocketAddr::new(peer_addr.ip(), client_rtp_port);
 
-            session.transport = Some(ClientTransport::Udp {
-                socket: udp_socket,
-                rtp_dest,
-            });
-
-            return Ok(Some(format!(
-                "RTP/AVP;unicast;client_port={client_rtp_port}-{client_rtcp_port};server_port={server_rtp_port}-{server_rtcp_port};ssrc={:08X}",
-                session.ssrc
+            let reply = format!(
+                "RTP/AVP;unicast;client_port={client_rtp_port}-{client_rtcp_port};server_port={server_rtp_port}-{server_rtcp_port};ssrc={ssrc:08X}"
+            );
+            return Ok(Some((
+                ClientTransport::Udp {
+                    socket: udp_socket,
+                    rtp_dest,
+                },
+                reply,
             )));
         }
     }
@@ -710,7 +802,7 @@ async fn setup_transport(
 
 async fn send_encoded_frame(
     stream: &mut TcpStream,
-    session: &mut SessionState,
+    transport: &Option<ClientTransport>,
     packetizer: &mut H264RtpPacketizer,
     frame: &EncodedFrame,
 ) -> Result<(), NvrDeskError> {
@@ -719,7 +811,7 @@ async fn send_encoded_frame(
         return Ok(());
     }
 
-    match &session.transport {
+    match transport {
         Some(ClientTransport::TcpInterleaved { rtp_channel }) => {
             let mut batch = BytesMut::new();
             for pkt in packets {
@@ -738,6 +830,28 @@ async fn send_encoded_frame(
         None => {}
     }
 
+    Ok(())
+}
+
+async fn send_single_rtp(
+    stream: &mut TcpStream,
+    transport: &Option<ClientTransport>,
+    pkt: &[u8],
+) -> Result<(), NvrDeskError> {
+    match transport {
+        Some(ClientTransport::TcpInterleaved { rtp_channel }) => {
+            let mut frame = BytesMut::with_capacity(4 + pkt.len());
+            frame.put_u8(b'$');
+            frame.put_u8(*rtp_channel);
+            frame.put_u16(pkt.len() as u16);
+            frame.extend_from_slice(pkt);
+            stream.write_all(&frame).await?;
+        }
+        Some(ClientTransport::Udp { socket, rtp_dest }) => {
+            socket.send_to(pkt, *rtp_dest).await?;
+        }
+        None => {}
+    }
     Ok(())
 }
 

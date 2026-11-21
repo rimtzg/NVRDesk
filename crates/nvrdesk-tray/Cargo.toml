@@ -1,0 +1,26 @@
+[package]
+name = "nvrdesk-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nvrdesk-daemon = { path = "../nvrdesk-daemon" }
+tracing.workspace = true
+tray-icon.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSRunningApplication", "NSResponder", "NSEvent"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSThread", "NSObject", "NSRunLoop", "NSDate", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }

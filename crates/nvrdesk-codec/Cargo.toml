@@ -14,3 +14,4 @@ workspace = true
 bytes.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 openh264.workspace = true
+tracing.workspace = true

@@ -1,5 +1,6 @@
-//! RTSP 1.0 server, Digest auth, SDP builder, and RFC 6184 H.264 RTP packetizer.
+//! RTSP 1.0 server, Digest auth, SDP builder, and RFC 6184/3551 RTP packetizers.
 
+pub mod audio_rtp;
 pub mod auth;
 pub mod rtp;
 pub mod sdp;

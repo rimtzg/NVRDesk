@@ -1,7 +1,127 @@
 //! Anti-aliased visual overlay renderer for mouse clicks, cursor highlight, and keystroke OSD.
 
+use fast_image_resize::{
+    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    images::{Image, ImageRef},
+};
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
-use nvrdesk_core::{InputOverlaySnapshot, MouseButton, PixelFormat};
+use nvrdesk_core::{InputOverlaySnapshot, MouseButton, PipPosition, PixelFormat, RawVideoFrame};
+
+/// Composites a webcam frame as Picture-in-Picture onto `buf` in the specified corner.
+#[allow(clippy::too_many_arguments)]
+pub fn composite_pip(
+    resizer: &mut Resizer,
+    buf: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    dst_stride: usize,
+    dst_format: PixelFormat,
+    pip: &RawVideoFrame,
+    position: PipPosition,
+    scale_ratio: f32,
+) {
+    if dst_w < 160 || dst_h < 120 || pip.width == 0 || pip.height == 0 {
+        return;
+    }
+
+    let target_w = ((dst_w as f32) * scale_ratio.clamp(0.10, 0.45)).round() as u32;
+    let target_w = target_w.max(64).min(dst_w.saturating_sub(16));
+    let target_h = ((u64::from(pip.height) * u64::from(target_w)) / u64::from(pip.width)) as u32;
+    let target_h = target_h.max(48).min(dst_h.saturating_sub(16));
+
+    let pip_bpp = pip.format.bytes_per_pixel();
+    let pip_row_bytes = (pip.width as usize) * pip_bpp;
+    if pip.stride < pip_row_bytes || pip.data.len() < pip.stride * (pip.height as usize) {
+        return;
+    }
+
+    let mut tight_pip = Vec::new();
+    let src_slice = if pip.stride == pip_row_bytes {
+        &pip.data[..pip_row_bytes * (pip.height as usize)]
+    } else {
+        tight_pip.resize(pip_row_bytes * (pip.height as usize), 0);
+        for row in 0..(pip.height as usize) {
+            let s = row * pip.stride;
+            let d = row * pip_row_bytes;
+            tight_pip[d..d + pip_row_bytes].copy_from_slice(&pip.data[s..s + pip_row_bytes]);
+        }
+        &tight_pip
+    };
+
+    let pixel_type = match pip.format {
+        PixelFormat::Bgra8 | PixelFormat::Rgba8 => PixelType::U8x4,
+        PixelFormat::Rgb8 => PixelType::U8x3,
+    };
+
+    let Ok(src_img) = ImageRef::new(pip.width, pip.height, src_slice, pixel_type) else {
+        return;
+    };
+    let mut scaled = vec![0u8; (target_w as usize) * (target_h as usize) * pip_bpp];
+    let Ok(mut dst_img) = Image::from_slice_u8(target_w, target_h, &mut scaled, pixel_type) else {
+        return;
+    };
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    if resizer.resize(&src_img, &mut dst_img, &opts).is_err() {
+        return;
+    }
+
+    let margin = ((dst_h as usize) / 40).max(8);
+    let ox = match position {
+        PipPosition::TopLeft | PipPosition::BottomLeft => margin,
+        PipPosition::TopRight | PipPosition::BottomRight => {
+            (dst_w as usize).saturating_sub(target_w as usize + margin)
+        }
+    };
+    let oy = match position {
+        PipPosition::TopLeft | PipPosition::TopRight => margin,
+        PipPosition::BottomLeft | PipPosition::BottomRight => {
+            (dst_h as usize).saturating_sub(target_h as usize + margin)
+        }
+    };
+
+    let dst_bpp = dst_format.bytes_per_pixel();
+    for y in 0..(target_h as usize) {
+        let py = oy + y;
+        if py >= dst_h as usize {
+            break;
+        }
+        for x in 0..(target_w as usize) {
+            let px = ox + x;
+            if px >= dst_w as usize {
+                break;
+            }
+            let s_idx = (y * (target_w as usize) + x) * pip_bpp;
+            let d_idx = py * dst_stride + px * dst_bpp;
+            let (r, g, b) =
+                if x == 0 || y == 0 || x + 1 == target_w as usize || y + 1 == target_h as usize {
+                    (30u8, 35u8, 45u8)
+                } else {
+                    match pip.format {
+                        PixelFormat::Rgba8 | PixelFormat::Rgb8 => {
+                            (scaled[s_idx], scaled[s_idx + 1], scaled[s_idx + 2])
+                        }
+                        PixelFormat::Bgra8 => (scaled[s_idx + 2], scaled[s_idx + 1], scaled[s_idx]),
+                    }
+                };
+            match dst_format {
+                PixelFormat::Rgba8 | PixelFormat::Rgb8 => {
+                    buf[d_idx] = r;
+                    buf[d_idx + 1] = g;
+                    buf[d_idx + 2] = b;
+                    if dst_bpp == 4 {
+                        buf[d_idx + 3] = 255;
+                    }
+                }
+                PixelFormat::Bgra8 => {
+                    buf[d_idx] = b;
+                    buf[d_idx + 1] = g;
+                    buf[d_idx + 2] = r;
+                    buf[d_idx + 3] = 255;
+                }
+            }
+        }
+    }
+}
 
 /// Renders cursor highlight, animated mouse click ripples, and keystroke OSD onto a packed buffer.
 pub fn draw_overlays(
@@ -279,5 +399,36 @@ mod tests {
         };
         draw_overlays(&mut buf, 640, 360, 640 * 4, PixelFormat::Rgba8, &snap);
         assert!(buf.iter().any(|&b| b != 0), "expected overlay pixels drawn");
+    }
+
+    #[test]
+    fn composites_pip_into_top_right_corner() {
+        let mut resizer = Resizer::new();
+        let mut dst = vec![0u8; 640 * 360 * 4];
+        let pip = RawVideoFrame {
+            width: 160,
+            height: 120,
+            stride: 160 * 4,
+            format: PixelFormat::Rgba8,
+            data: vec![200u8; 160 * 120 * 4],
+            timestamp_us: 0,
+        };
+        composite_pip(
+            &mut resizer,
+            &mut dst,
+            640,
+            360,
+            640 * 4,
+            PixelFormat::Bgra8,
+            &pip,
+            PipPosition::TopRight,
+            0.25,
+        );
+        // Top-right area must contain PiP pixels while top-left remains untouched (0).
+        assert_eq!(dst[0], 0);
+        let check_x = 580;
+        let check_y = 40;
+        let idx = (check_y * 640 + check_x) * 4;
+        assert_eq!(dst[idx], 200);
     }
 }

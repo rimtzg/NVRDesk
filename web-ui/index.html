@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NVRDesk Control Panel</title>
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">ND</span>
+        <div>
+          <h1>NVRDesk</h1>
+          <p class="subtitle">Virtual ONVIF / RTSP IP Camera for POS &amp; Desktop</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="status-badge" class="badge">Connecting...</span>
+        <button id="toggle-pause-btn" class="btn btn-secondary">Pause</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card preview-card">
+        <div class="card-header">
+          <h2>Live Preview</h2>
+          <select id="preview-profile" class="select-sm">
+            <option value="main">MainStream</option>
+            <option value="sub">SubStream</option>
+          </select>
+        </div>
+        <div class="preview-wrap">
+          <img id="preview-img" src="/preview/main.mjpeg" alt="Live NVRDesk Preview" />
+        </div>
+        <div class="endpoints" id="endpoints-list"></div>
+      </section>
+
+      <section class="card stats-card">
+        <h2>Telemetry</h2>
+        <div class="stats-grid">
+          <div class="stat-box">
+            <span class="stat-label">Active Players</span>
+            <strong id="stat-players">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Main Frames</span>
+            <strong id="stat-main-frames">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Sub Frames</span>
+            <strong id="stat-sub-frames">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Encoder</span>
+            <strong id="stat-encoder">-</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Recording Disk</span>
+            <strong id="stat-recording">Off</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">ONVIF HTTP</span>
+            <strong id="stat-onvif">-</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="card config-card">
+        <div class="card-header">
+          <h2>Configuration</h2>
+          <button id="save-cfg-btn" class="btn btn-primary">Save &amp; Apply</button>
+        </div>
+        <form id="cfg-form" class="form-grid">
+          <label>
+            Monitor
+            <select id="cfg-display"></select>
+          </label>
+          <label>
+            Encoder Backend
+            <select id="cfg-encoder-backend">
+              <option value="auto">Auto (HW FFmpeg -&gt; OpenH264)</option>
+              <option value="openh264">OpenH264 (Built-in MIT)</option>
+              <option value="ffmpeg">External FFmpeg CLI</option>
+            </select>
+          </label>
+          <label>
+            Main FPS
+            <input id="cfg-main-fps" type="number" min="1" max="60" />
+          </label>
+          <label>
+            Main Bitrate (bps)
+            <input id="cfg-main-bitrate" type="number" min="100000" step="100000" />
+          </label>
+          <label>
+            Keystroke OSD Mode
+            <select id="cfg-keystroke-mode">
+              <option value="masked_digits">Masked Digits (PCI-safe)</option>
+              <option value="shortcuts_and_special">Shortcuts &amp; Special Keys</option>
+              <option value="all">All Keys</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+          <label class="checkbox-row">
+            <input id="cfg-show-clicks" type="checkbox" />
+            Show Mouse Click Ripples
+          </label>
+
+          <hr class="divider" />
+
+          <label class="checkbox-row">
+            <input id="cfg-webcam-enabled" type="checkbox" />
+            Enable Webcam
+          </label>
+          <label>
+            Webcam Device
+            <select id="cfg-webcam-device"></select>
+          </label>
+          <label>
+            Webcam Mode
+            <select id="cfg-webcam-mode">
+              <option value="pip">Picture-in-Picture</option>
+              <option value="channel">Dedicated RTSP Channel (/webcam)</option>
+            </select>
+          </label>
+          <label>
+            PiP Corner
+            <select id="cfg-pip-pos">
+              <option value="top_right">Top Right</option>
+              <option value="top_left">Top Left</option>
+              <option value="bottom_right">Bottom Right</option>
+              <option value="bottom_left">Bottom Left</option>
+            </select>
+          </label>
+
+          <hr class="divider" />
+
+          <label class="checkbox-row">
+            <input id="cfg-audio-enabled" type="checkbox" />
+            Enable Microphone Audio
+          </label>
+          <label>
+            Microphone Device
+            <select id="cfg-audio-device"></select>
+          </label>
+          <label>
+            Audio Codec
+            <select id="cfg-audio-codec">
+              <option value="pcmu">G.711 PCMU (mu-law 8kHz)</option>
+              <option value="pcma">G.711 PCMA (A-law 8kHz)</option>
+            </select>
+          </label>
+          <label class="checkbox-row">
+            <input id="cfg-rec-enabled" type="checkbox" />
+            Enable Local Ring Recording
+          </label>
+          <label>
+            Recording Max Quota (MB)
+            <input id="cfg-rec-max-mb" type="number" min="64" step="64" />
+          </label>
+        </form>
+        <p id="save-msg" class="save-msg"></p>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

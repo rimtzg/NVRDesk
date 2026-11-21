@@ -1,4 +1,7 @@
-//! Video capture sources for NVRDesk (cross-platform screen + cursor and synthetic test pattern).
+//! Video & audio capture sources for NVRDesk (screen + cursor, webcam, microphone, test pattern).
+
+pub mod audio;
+pub mod webcam;
 
 use std::sync::{
     Arc,
@@ -8,9 +11,43 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use nvrdesk_core::{MonitorBounds, NvrDeskError, PixelFormat, RawVideoFrame};
+pub use audio::{AudioCaptureSource, list_microphones};
+use nvrdesk_core::{
+    DeviceEntry, DeviceInventory, MonitorBounds, NvrDeskError, PixelFormat, RawVideoFrame,
+};
 use tracing::{debug, warn};
+pub use webcam::{WebcamCaptureSource, list_webcams};
 use xcap::{Frame as XcapFrame, Monitor, Window};
+
+/// Enumerates monitors, webcams, and microphones on the host OS.
+#[must_use]
+pub fn enumerate_devices() -> DeviceInventory {
+    let monitors = Monitor::all()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, m)| {
+            let name = m
+                .friendly_name()
+                .or_else(|_| m.name())
+                .unwrap_or_else(|_| format!("Display {index}"));
+            let w = m.width().unwrap_or(0);
+            let h = m.height().unwrap_or(0);
+            DeviceEntry {
+                index,
+                name,
+                detail: format!("{w}x{h}"),
+                is_default: m.is_primary().unwrap_or(index == 0),
+            }
+        })
+        .collect();
+
+    DeviceInventory {
+        monitors,
+        webcams: list_webcams(),
+        microphones: list_microphones(),
+    }
+}
 
 /// Returns the title of the currently focused OS window, if available.
 #[must_use]

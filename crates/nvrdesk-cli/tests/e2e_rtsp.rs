@@ -44,11 +44,13 @@ async fn streams_dual_h264_with_overlays_and_passes_ffprobe() {
             path: "/stream1".to_string(),
             aliases: vec!["/stream".to_string()],
             name: "NVRDesk Main E2E".to_string(),
+            audio_codec: None,
         },
         RtspStreamSpec {
             path: "/stream2".to_string(),
             aliases: Vec::new(),
             name: "NVRDesk Sub E2E".to_string(),
+            audio_codec: None,
         },
     ];
 
@@ -513,4 +515,175 @@ async fn send_http_raw(
     let mut out = Vec::new();
     sock.read_to_end(&mut out).await.expect("read http");
     out
+}
+
+#[tokio::test]
+async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
+    use nvrdesk_codec::audio::encode_g711;
+    use nvrdesk_core::{AudioCodecKind, CaptureSourceKind, EncoderBackendKind, NvrDeskConfig};
+    use nvrdesk_daemon::start_daemon;
+
+    let mut cfg = NvrDeskConfig::default();
+    cfg.source.kind = CaptureSourceKind::TestPattern;
+    cfg.encoder.backend = EncoderBackendKind::Openh264;
+    cfg.rtsp.bind = "127.0.0.1".to_string();
+    cfg.rtsp.port = 0;
+    cfg.onvif.http_port = 0;
+    cfg.onvif.discovery_enabled = false;
+    cfg.daemon.tray_enabled = false;
+    cfg.input_overlay.enabled = false;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (handle, worker) = start_daemon(cfg, None, Arc::clone(&shutdown))
+        .await
+        .expect("start_daemon");
+
+    let web_url = handle.web_ui_url();
+    let http_port: u16 = web_url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port);
+
+    // 1. Embedded Web UI HTML served on `/`
+    let index_resp = send_http(http_addr, "GET", "/", &[], "").await;
+    assert!(index_resp.starts_with("HTTP/1.1 200 OK"), "{index_resp}");
+    assert!(index_resp.contains("NVRDesk Control Panel"));
+
+    // 2. REST API status & pause/resume
+    let status_resp = send_http(http_addr, "GET", "/api/v1/status", &[], "").await;
+    assert!(status_resp.starts_with("HTTP/1.1 200 OK"));
+    assert!(status_resp.contains("\"paused\":false"));
+
+    let pause_resp = send_http(http_addr, "POST", "/api/v1/control/pause", &[], "").await;
+    assert!(pause_resp.starts_with("HTTP/1.1 200 OK"));
+    assert!(handle.is_paused());
+
+    let resume_resp = send_http(http_addr, "POST", "/api/v1/control/resume", &[], "").await;
+    assert!(resume_resp.starts_with("HTTP/1.1 200 OK"));
+    assert!(!handle.is_paused());
+
+    // 3. Multi-track RTSP (Video trackID=0 + Audio PCMU trackID=1)
+    let (rtsp_srv, rtsp_addr, mut handles) = RtspServer::bind_streams(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        None,
+        vec![RtspStreamSpec {
+            path: "/av".to_string(),
+            aliases: Vec::new(),
+            name: "AV Test".to_string(),
+            audio_codec: Some(AudioCodecKind::Pcmu),
+        }],
+    )
+    .await
+    .expect("bind av rtsp");
+    let av_handle = handles.remove("/av").expect("av handle");
+    let av_task = tokio::spawn(async move {
+        let _ = rtsp_srv.serve().await;
+    });
+
+    let av_url = format!("rtsp://127.0.0.1:{}/av", rtsp_addr.port());
+    let mut sock = TcpStream::connect(rtsp_addr).await.expect("connect av");
+
+    // Background feeder publishes 1 keyframe + 1 PCMU audio packet once PLAY starts.
+    let av_pub = av_handle.clone();
+    let feeder = tokio::spawn(async move {
+        let mut enc = OpenH264Encoder::new(&StreamConfig {
+            fps: 10,
+            bitrate_bps: 400_000,
+            max_width: 320,
+            idr_interval_secs: 1,
+            show_cursor: false,
+        })
+        .expect("enc");
+        let frame = nvrdesk_core::I420Frame::new(320, 240, 0).expect("i420");
+        for _ in 0..15 {
+            let encoded = enc.encode(&frame, true).expect("encode");
+            av_pub.publish_frame(encoded);
+            av_pub.publish_audio(encode_g711(&[0i16; 160], AudioCodecKind::Pcmu, 160));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let desc = send_rtsp(
+        &mut sock,
+        &format!("DESCRIBE {av_url} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        desc.contains("m=audio 0 RTP/AVP 0"),
+        "missing audio in SDP: {desc}"
+    );
+
+    let s_v = send_rtsp(
+        &mut sock,
+        &format!("SETUP {av_url}/trackID=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"),
+    )
+    .await;
+    assert!(s_v.starts_with("RTSP/1.0 200 OK"));
+    let session_id = s_v
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("session:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
+        .expect("session id");
+
+    let s_a = send_rtsp(
+        &mut sock,
+        &format!("SETUP {av_url}/trackID=1 RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        s_a.starts_with("RTSP/1.0 200 OK"),
+        "audio SETUP failed: {s_a}"
+    );
+
+    let play = send_rtsp(
+        &mut sock,
+        &format!("PLAY {av_url} RTSP/1.0\r\nCSeq: 4\r\nSession: {session_id}\r\n\r\n"),
+    )
+    .await;
+    assert!(play.starts_with("RTSP/1.0 200 OK"));
+
+    let mut saw_video_ch = false;
+    let mut saw_audio_ch = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut buf = Vec::new();
+    while Instant::now() < deadline && (!saw_video_ch || !saw_audio_ch) {
+        let mut tmp = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp))
+            .await
+            .expect("av rtp timeout")
+            .expect("av rtp read");
+        assert!(n > 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while buf.len() >= 4 {
+            if buf[0] != b'$' {
+                buf.remove(0);
+                continue;
+            }
+            let ch = buf[1];
+            let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            if buf.len() < 4 + len {
+                break;
+            }
+            if ch == 0 {
+                saw_video_ch = true;
+            } else if ch == 2 {
+                saw_audio_ch = true;
+            }
+            buf.drain(..4 + len);
+        }
+    }
+    assert!(
+        saw_video_ch && saw_audio_ch,
+        "expected both video (ch 0) and audio (ch 2) RTP packets"
+    );
+
+    feeder.abort();
+    av_task.abort();
+    shutdown.store(true, Ordering::Release);
+    let _ = worker.join();
 }

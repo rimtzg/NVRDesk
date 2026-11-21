@@ -7,7 +7,9 @@ use fast_image_resize::{
     images::{Image, ImageRef},
 };
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
-use nvrdesk_core::{I420Frame, InputOverlaySnapshot, NvrDeskError, PixelFormat, RawVideoFrame};
+use nvrdesk_core::{
+    I420Frame, InputOverlaySnapshot, NvrDeskError, PipPosition, PixelFormat, RawVideoFrame,
+};
 use yuvutils_rs::{
     BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
     bgra_to_yuv420, rgb_to_yuv420, rgba_to_yuv420,
@@ -54,14 +56,16 @@ impl FrameProcessor {
         }
     }
 
-    /// Scales (if needed), renders `overlay` at target resolution, and converts to planar I420.
-    pub fn process_with_overlay(
+    /// Scales (if needed), composites optional webcam PiP + input overlays, and converts to I420.
+    pub fn process_full(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
         overlay_snap: Option<&InputOverlaySnapshot>,
+        pip: Option<(&RawVideoFrame, PipPosition, f32)>,
     ) -> Result<I420Frame, NvrDeskError> {
-        let (dst_w, dst_h, dst_stride) = self.prepare_packed(frame, max_width, overlay_snap)?;
+        let (dst_w, dst_h, dst_stride) =
+            self.prepare_packed(frame, max_width, overlay_snap, pip)?;
         convert_packed_to_i420(
             &self.work_buf,
             dst_stride as u32,
@@ -72,24 +76,35 @@ impl FrameProcessor {
         )
     }
 
+    /// Scales (if needed), renders `overlay` at target resolution, and converts to planar I420.
+    pub fn process_with_overlay(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+    ) -> Result<I420Frame, NvrDeskError> {
+        self.process_full(frame, max_width, overlay_snap, None)
+    }
+
     /// Scales and converts `frame` into planar I420 without overlays.
     pub fn process(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
     ) -> Result<I420Frame, NvrDeskError> {
-        self.process_with_overlay(frame, max_width, None)
+        self.process_full(frame, max_width, None, None)
     }
 
-    /// Scales, renders `overlay`, and encodes a JPEG snapshot in memory.
-    pub fn encode_jpeg_snapshot(
+    /// Scales, composites optional PiP + `overlay`, and encodes a JPEG snapshot in memory.
+    pub fn encode_jpeg_snapshot_full(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
         quality: u8,
         overlay_snap: Option<&InputOverlaySnapshot>,
+        pip: Option<(&RawVideoFrame, PipPosition, f32)>,
     ) -> Result<Vec<u8>, NvrDeskError> {
-        let (dst_w, dst_h, _) = self.prepare_packed(frame, max_width, overlay_snap)?;
+        let (dst_w, dst_h, _) = self.prepare_packed(frame, max_width, overlay_snap, pip)?;
         let color_type = match frame.format {
             PixelFormat::Bgra8 => ColorType::Bgra,
             PixelFormat::Rgba8 => ColorType::Rgba,
@@ -103,11 +118,23 @@ impl FrameProcessor {
         Ok(out)
     }
 
+    /// Scales, renders `overlay`, and encodes a JPEG snapshot in memory.
+    pub fn encode_jpeg_snapshot(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        quality: u8,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+    ) -> Result<Vec<u8>, NvrDeskError> {
+        self.encode_jpeg_snapshot_full(frame, max_width, quality, overlay_snap, None)
+    }
+
     fn prepare_packed(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
         overlay_snap: Option<&InputOverlaySnapshot>,
+        pip: Option<(&RawVideoFrame, PipPosition, f32)>,
     ) -> Result<(u32, u32, usize), NvrDeskError> {
         let (dst_w, dst_h) = compute_target_dimensions(frame.width, frame.height, max_width);
         if dst_w == 0 || dst_h == 0 {
@@ -176,6 +203,20 @@ impl FrameProcessor {
             self.resizer
                 .resize(&src_img, &mut dst_img, &options)
                 .map_err(|e| NvrDeskError::Pipeline(format!("resize failed: {e}")))?;
+        }
+
+        if let Some((pip_frame, pos, scale)) = pip {
+            overlay::composite_pip(
+                &mut self.resizer,
+                &mut self.work_buf,
+                dst_w,
+                dst_h,
+                dst_stride,
+                frame.format,
+                pip_frame,
+                pos,
+                scale,
+            );
         }
 
         if let Some(snap) = overlay_snap {

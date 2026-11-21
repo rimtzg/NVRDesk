@@ -1,18 +1,29 @@
-//! Video encoders for NVRDesk (MIT-compatible software OpenH264 and future hardware backends).
+//! Video and audio encoders for NVRDesk (MIT-compatible OpenH264, G.711, and optional FFmpeg).
+
+pub mod audio;
+pub mod ffmpeg;
 
 use bytes::Bytes;
-use nvrdesk_core::{EncodedFrame, I420Frame, NvrDeskError, StreamConfig};
+use nvrdesk_core::{
+    EncodedFrame, EncoderBackendKind, EncoderConfig, I420Frame, NvrDeskError, StreamConfig,
+};
 use openh264::{
     OpenH264API,
     encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
-        RateControlMode, SpsPpsStrategy, UsageType, VuiConfig,
+        BitRate, Complexity, Encoder, EncoderConfig as OpenH264Config, FrameRate, FrameType,
+        IntraFramePeriod, RateControlMode, SpsPpsStrategy, UsageType, VuiConfig,
     },
     formats::YUVSource,
 };
+use tracing::info;
+
+use crate::ffmpeg::{FfmpegCliEncoder, probe_hw_h264_codec};
 
 /// Abstraction over a video encoder producing Annex-B stripped H.264/H.265 access units.
 pub trait VideoEncoder: Send {
+    /// Human-readable encoder name (e.g. `"openh264"` or `"h264_videotoolbox"`).
+    fn name(&self) -> &str;
+
     /// Encodes one planar I420 frame.
     fn encode(
         &mut self,
@@ -22,6 +33,44 @@ pub trait VideoEncoder: Send {
 
     /// Returns the most recently observed SPS and PPS NAL units, if available.
     fn parameter_sets(&self) -> (Option<Bytes>, Option<Bytes>);
+}
+
+/// Creates a video encoder matching `enc_cfg` with automatic fallback to `OpenH264Encoder`.
+pub fn create_video_encoder(
+    stream_cfg: &StreamConfig,
+    enc_cfg: &EncoderConfig,
+) -> Result<Box<dyn VideoEncoder>, NvrDeskError> {
+    match enc_cfg.backend {
+        EncoderBackendKind::Openh264 => Ok(Box::new(OpenH264Encoder::new(stream_cfg)?)),
+        EncoderBackendKind::Ffmpeg => {
+            let codec = enc_cfg
+                .ffmpeg_codec
+                .clone()
+                .or_else(|| probe_hw_h264_codec(&enc_cfg.ffmpeg_path).map(str::to_string))
+                .unwrap_or_else(|| "libx264".to_string());
+            info!(codec = %codec, "initializing external FFmpeg video encoder");
+            Ok(Box::new(FfmpegCliEncoder::new(
+                enc_cfg.ffmpeg_path.clone(),
+                codec,
+                stream_cfg,
+            )))
+        }
+        EncoderBackendKind::Auto => {
+            if let Some(hw_codec) = enc_cfg
+                .ffmpeg_codec
+                .as_deref()
+                .or_else(|| probe_hw_h264_codec(&enc_cfg.ffmpeg_path))
+            {
+                info!(codec = %hw_codec, "using hardware-accelerated FFmpeg video encoder");
+                return Ok(Box::new(FfmpegCliEncoder::new(
+                    enc_cfg.ffmpeg_path.clone(),
+                    hw_codec.to_string(),
+                    stream_cfg,
+                )));
+            }
+            Ok(Box::new(OpenH264Encoder::new(stream_cfg)?))
+        }
+    }
 }
 
 struct I420Adapter<'a>(&'a I420Frame);
@@ -61,7 +110,7 @@ impl OpenH264Encoder {
         let fps = config.fps.max(1);
         let idr_frames = fps.saturating_mul(config.idr_interval_secs.max(1));
 
-        let enc_cfg = EncoderConfig::new()
+        let enc_cfg = OpenH264Config::new()
             .bitrate(BitRate::from_bps(config.bitrate_bps.max(100_000)))
             .max_frame_rate(FrameRate::from_hz(fps as f32))
             .usage_type(UsageType::ScreenContentRealTime)
@@ -86,6 +135,10 @@ impl OpenH264Encoder {
 }
 
 impl VideoEncoder for OpenH264Encoder {
+    fn name(&self) -> &str {
+        "openh264"
+    }
+
     fn encode(
         &mut self,
         frame: &I420Frame,
@@ -174,10 +227,10 @@ pub fn split_annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
         }
     }
 
-    if let Some(start) = nal_start {
-        if start < data.len() {
-            nals.push(&data[start..]);
-        }
+    if let Some(start) = nal_start
+        && start < data.len()
+    {
+        nals.push(&data[start..]);
     } else if !data.is_empty() {
         nals.push(data);
     }

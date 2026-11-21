@@ -1,0 +1,30 @@
+[package]
+name = "nvrdesk-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-core.workspace = true
+nvrdesk-capture = { path = "../nvrdesk-capture" }
+nvrdesk-codec = { path = "../nvrdesk-codec" }
+nvrdesk-core = { path = "../nvrdesk-core" }
+nvrdesk-input = { path = "../nvrdesk-input" }
+nvrdesk-onvif = { path = "../nvrdesk-onvif" }
+nvrdesk-pipeline = { path = "../nvrdesk-pipeline" }
+nvrdesk-rtsp = { path = "../nvrdesk-rtsp" }
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
