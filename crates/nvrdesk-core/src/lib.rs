@@ -313,7 +313,7 @@ impl Default for InputOverlayConfig {
         Self {
             enabled: true,
             show_clicks: true,
-            show_cursor_highlight: true,
+            show_cursor_highlight: false,
             show_keystrokes: true,
             keystroke_mode: KeystrokeMode::MaskedDigits,
             keystroke_ttl_ms: 4000,

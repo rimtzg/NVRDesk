@@ -127,20 +127,6 @@ fn draw_keystroke_pill(
         [14, 18, 26, 210],
     );
 
-    // Subtle light border (1 px).
-    draw_rect_border(
-        buf,
-        width,
-        height,
-        stride,
-        format,
-        box_x,
-        box_y,
-        box_w,
-        box_h,
-        [90, 170, 255, 200],
-    );
-
     let text_x = box_x + pad_x;
     let text_y = box_y + pad_y;
     for (i, ch) in chars.into_iter().enumerate() {
@@ -230,34 +216,6 @@ fn fill_rect_blend(
         for px in x..end_x {
             blend_pixel(buf, stride, format, px, py, rgba);
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_rect_border(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    stride: usize,
-    format: PixelFormat,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    rgba: [u8; 4],
-) {
-    if w < 2 || h < 2 {
-        return;
-    }
-    let end_x = (x + w - 1).min(width as usize - 1);
-    let end_y = (y + h - 1).min(height as usize - 1);
-    for px in x..=end_x {
-        blend_pixel(buf, stride, format, px, y, rgba);
-        blend_pixel(buf, stride, format, px, end_y, rgba);
-    }
-    for py in (y + 1)..end_y {
-        blend_pixel(buf, stride, format, x, py, rgba);
-        blend_pixel(buf, stride, format, end_x, py, rgba);
     }
 }
 
