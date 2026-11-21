@@ -1,14 +1,18 @@
-//! ONVIF Profile S SOAP request parser and response XML builders (Device & Media services).
+//! ONVIF Profile S & Profile T SOAP parser and response XML builders (Device, Media, Media2, Events).
 
 use chrono::{Datelike, Timelike, Utc};
+use nvrdesk_core::VideoCodecKind;
 use quick_xml::{Reader, events::Event};
 
-/// ONVIF Media Profile metadata exposed via `GetProfiles` / `GetStreamUri` / `GetSnapshotUri`.
-#[derive(Debug, Clone)]
+use crate::events::OnvifEventRecord;
+
+/// ONVIF Media/Media2 Profile metadata exposed via `GetProfiles` / `GetStreamUri` / `GetSnapshotUri`.
+#[derive(Debug, Clone, Default)]
 pub struct OnvifMediaProfile {
     pub token: String,
     pub name: String,
     pub encoder_token: String,
+    pub encoding: VideoCodecKind,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -18,8 +22,8 @@ pub struct OnvifMediaProfile {
     pub snapshot_slug: String,
 }
 
-/// Device metadata used in ONVIF Device service responses.
-#[derive(Debug, Clone)]
+/// Device metadata used in ONVIF Device/Media2/Events service responses.
+#[derive(Debug, Clone, Default)]
 pub struct OnvifDeviceMeta {
     pub device_name: String,
     pub manufacturer: String,
@@ -28,18 +32,25 @@ pub struct OnvifDeviceMeta {
     pub serial_number: String,
     pub hardware_id: String,
     pub rtsp_port: u16,
+    pub rtsps_port: Option<u16>,
     pub http_port: u16,
+    pub https_enabled: bool,
+    pub audio_enabled: bool,
+    pub backchannel_enabled: bool,
 }
 
 /// Parsed SOAP Body operation name and relevant inner elements.
 #[derive(Debug, Default)]
 pub struct SoapRequestInfo {
     pub action: String,
+    pub is_media2: bool,
     pub profile_token: Option<String>,
     pub configuration_token: Option<String>,
+    pub message_limit: Option<usize>,
+    pub timeout_secs: Option<u64>,
 }
 
-/// Extracts the SOAP Body root element local name and optional `ProfileToken` / `ConfigurationToken`.
+/// Extracts the SOAP Body root element local name, namespace hints, and inner fields.
 #[must_use]
 pub fn parse_soap_request(xml: &str) -> Option<SoapRequestInfo> {
     let mut reader = Reader::from_str(xml);
@@ -53,6 +64,7 @@ pub fn parse_soap_request(xml: &str) -> Option<SoapRequestInfo> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
+                let qname = e.name().as_ref().to_string();
                 let local = e.local_name().as_ref().to_string();
                 if local == "Body" {
                     in_body = true;
@@ -61,14 +73,21 @@ pub fn parse_soap_request(xml: &str) -> Option<SoapRequestInfo> {
                     body_depth += 1;
                     if body_depth == 1 && info.action.is_empty() {
                         info.action = local.clone();
+                        if qname.starts_with("tr2:") || xml.contains("ver20/media/wsdl") {
+                            info.is_media2 = true;
+                        }
                     }
                     current_tag = Some(local);
                 }
             }
             Ok(Event::Empty(e)) => {
+                let qname = e.name().as_ref().to_string();
                 let local = e.local_name().as_ref().to_string();
                 if in_body && body_depth == 0 && info.action.is_empty() {
                     info.action = local;
+                    if qname.starts_with("tr2:") || xml.contains("ver20/media/wsdl") {
+                        info.is_media2 = true;
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -88,6 +107,11 @@ pub fn parse_soap_request(xml: &str) -> Option<SoapRequestInfo> {
                 match current_tag.as_deref() {
                     Some("ProfileToken") => info.profile_token = Some(txt.into_owned()),
                     Some("ConfigurationToken") => info.configuration_token = Some(txt.into_owned()),
+                    Some("MessageLimit") => info.message_limit = txt.trim().parse().ok(),
+                    Some("Timeout") => {
+                        let digits: String = txt.chars().filter(char::is_ascii_digit).collect();
+                        info.timeout_secs = digits.parse().ok();
+                    }
                     _ => {}
                 }
             }
@@ -109,6 +133,11 @@ fn soap_envelope(body_xml: &str) -> String {
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+            xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+            xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+            xmlns:wsa="http://www.w3.org/2005/08/addressing"
+            xmlns:tns1="http://www.onvif.org/ver10/topics"
             xmlns:tt="http://www.onvif.org/ver10/schema">
   <s:Body>
     {body_xml}
@@ -185,8 +214,10 @@ pub fn get_device_information_response(meta: &OnvifDeviceMeta) -> String {
 }
 
 #[must_use]
-pub fn get_capabilities_response(host: &str, http_port: u16) -> String {
-    let base = format!("http://{host}:{http_port}");
+pub fn get_capabilities_response(host: &str, http_port: u16, https_enabled: bool) -> String {
+    let scheme = if https_enabled { "https" } else { "http" };
+    let base = format!("{scheme}://{host}:{http_port}");
+    let tls_flag = if https_enabled { "true" } else { "false" };
     soap_envelope(&format!(
         r#"<tds:GetCapabilitiesResponse>
       <tds:Capabilities>
@@ -205,12 +236,12 @@ pub fn get_capabilities_response(host: &str, http_port: u16) -> String {
             <tt:SystemBackup>false</tt:SystemBackup>
             <tt:SystemLogging>false</tt:SystemLogging>
             <tt:FirmwareUpgrade>false</tt:FirmwareUpgrade>
-            <tt:SupportedVersions><tt:Major>2</tt:Major><tt:Minor>50</tt:Minor></tt:SupportedVersions>
+            <tt:SupportedVersions><tt:Major>18</tt:Major><tt:Minor>12</tt:Minor></tt:SupportedVersions>
           </tt:System>
           <tt:IO><tt:InputConnectors>0</tt:InputConnectors><tt:RelayOutputs>0</tt:RelayOutputs></tt:IO>
           <tt:Security>
             <tt:TLS1.1>false</tt:TLS1.1>
-            <tt:TLS1.2>false</tt:TLS1.2>
+            <tt:TLS1.2>{tls_flag}</tt:TLS1.2>
             <tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration>
             <tt:AccessPolicyConfig>false</tt:AccessPolicyConfig>
             <tt:X.509Token>false</tt:X.509Token>
@@ -219,6 +250,12 @@ pub fn get_capabilities_response(host: &str, http_port: u16) -> String {
             <tt:RELToken>false</tt:RELToken>
           </tt:Security>
         </tt:Device>
+        <tt:Events>
+          <tt:XAddr>{base}/onvif/events_service</tt:XAddr>
+          <tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>
+          <tt:WSPullPointSupport>true</tt:WSPullPointSupport>
+          <tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>
+        </tt:Events>
         <tt:Media>
           <tt:XAddr>{base}/onvif/media_service</tt:XAddr>
           <tt:StreamingCapabilities>
@@ -233,18 +270,29 @@ pub fn get_capabilities_response(host: &str, http_port: u16) -> String {
 }
 
 #[must_use]
-pub fn get_services_response(host: &str, http_port: u16) -> String {
-    let base = format!("http://{host}:{http_port}");
+pub fn get_services_response(host: &str, http_port: u16, https_enabled: bool) -> String {
+    let scheme = if https_enabled { "https" } else { "http" };
+    let base = format!("{scheme}://{host}:{http_port}");
     soap_envelope(&format!(
         r#"<tds:GetServicesResponse>
       <tds:Service>
         <tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>
         <tds:XAddr>{base}/onvif/device_service</tds:XAddr>
-        <tds:Version><tt:Major>2</tt:Major><tt:Minor>50</tt:Minor></tds:Version>
+        <tds:Version><tt:Major>18</tt:Major><tt:Minor>12</tt:Minor></tds:Version>
       </tds:Service>
       <tds:Service>
         <tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>
         <tds:XAddr>{base}/onvif/media_service</tds:XAddr>
+        <tds:Version><tt:Major>2</tt:Major><tt:Minor>50</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service>
+        <tds:Namespace>http://www.onvif.org/ver20/media/wsdl</tds:Namespace>
+        <tds:XAddr>{base}/onvif/media2_service</tds:XAddr>
+        <tds:Version><tt:Major>18</tt:Major><tt:Minor>12</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service>
+        <tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace>
+        <tds:XAddr>{base}/onvif/events_service</tds:XAddr>
         <tds:Version><tt:Major>2</tt:Major><tt:Minor>50</tt:Minor></tds:Version>
       </tds:Service>
     </tds:GetServicesResponse>"#
@@ -252,16 +300,17 @@ pub fn get_services_response(host: &str, http_port: u16) -> String {
 }
 
 #[must_use]
-pub fn get_service_capabilities_response() -> String {
-    soap_envelope(
+pub fn get_service_capabilities_response(https_enabled: bool) -> String {
+    let tls_flag = if https_enabled { "true" } else { "false" };
+    soap_envelope(&format!(
         r#"<tds:GetServiceCapabilitiesResponse>
       <tds:Capabilities>
         <tds:Network IPFilter="false" ZeroConfiguration="false" IPVersion6="false" DynDNS="false"/>
-        <tds:Security TLS1.0="false" TLS1.1="false" TLS1.2="false" OnboardKeyGeneration="false" AccessPolicyConfig="false" DefaultAccessPolicy="false" Dot1X="false" RemoteUserHandling="false" X.509Token="false" SAMLToken="false" KerberosToken="false" UsernameToken="true" HttpDigest="true" RELToken="false"/>
+        <tds:Security TLS1.0="false" TLS1.1="false" TLS1.2="{tls_flag}" OnboardKeyGeneration="false" AccessPolicyConfig="false" DefaultAccessPolicy="false" Dot1X="false" RemoteUserHandling="false" X.509Token="false" SAMLToken="false" KerberosToken="false" UsernameToken="true" HttpDigest="true" RELToken="false"/>
         <tds:System DiscoveryResolve="true" DiscoveryBye="false" RemoteDiscovery="false" SystemBackup="false" SystemLogging="false" FirmwareUpgrade="false"/>
       </tds:Capabilities>
-    </tds:GetServiceCapabilitiesResponse>"#,
-    )
+    </tds:GetServiceCapabilitiesResponse>"#
+    ))
 }
 
 #[must_use]
@@ -273,6 +322,7 @@ pub fn get_scopes_response(meta: &OnvifDeviceMeta) -> String {
       <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem></tds:Scopes>
       <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/NetworkVideoTransmitter</tt:ScopeItem></tds:Scopes>
       <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes>
+      <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/T</tt:ScopeItem></tds:Scopes>
       <tds:Scopes><tt:ScopeDef>Configurable</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/name/{name}</tt:ScopeItem></tds:Scopes>
       <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/hardware/{model}</tt:ScopeItem></tds:Scopes>
       <tds:Scopes><tt:ScopeDef>Configurable</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/location/POS</tt:ScopeItem></tds:Scopes>
@@ -327,7 +377,15 @@ pub fn get_dns_response() -> String {
     )
 }
 
+fn encoding_str(codec: VideoCodecKind) -> &'static str {
+    match codec {
+        VideoCodecKind::H264 => "H264",
+        VideoCodecKind::H265 => "H265",
+    }
+}
+
 fn render_profile_xml(tag: &str, p: &OnvifMediaProfile, src_w: u32, src_h: u32) -> String {
+    let enc = encoding_str(p.encoding);
     format!(
         r#"<{tag} token="{token}" fixed="true">
       <tt:Name>{name}</tt:Name>
@@ -338,9 +396,9 @@ fn render_profile_xml(tag: &str, p: &OnvifMediaProfile, src_w: u32, src_h: u32) 
         <tt:Bounds x="0" y="0" width="{src_w}" height="{src_h}"/>
       </tt:VideoSourceConfiguration>
       <tt:VideoEncoderConfiguration token="{enc_token}">
-        <tt:Name>{name}H264</tt:Name>
+        <tt:Name>{name}{enc}</tt:Name>
         <tt:UseCount>1</tt:UseCount>
-        <tt:Encoding>H264</tt:Encoding>
+        <tt:Encoding>{enc}</tt:Encoding>
         <tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>
         <tt:Quality>5.0</tt:Quality>
         <tt:RateControl>
@@ -510,6 +568,234 @@ pub fn get_snapshot_uri_response(snapshot_uri: &str) -> String {
     </trt:GetSnapshotUriResponse>"#,
         escape_xml(snapshot_uri)
     ))
+}
+
+#[must_use]
+pub fn media2_get_profiles_response(
+    profiles: &[OnvifMediaProfile],
+    meta: &OnvifDeviceMeta,
+) -> String {
+    let (src_w, src_h) = profiles
+        .first()
+        .map_or((1920, 1080), |p| (p.width, p.height));
+    let mut inner = String::new();
+    for p in profiles {
+        let enc = encoding_str(p.encoding);
+        let audio_xml = if meta.audio_enabled {
+            r#"<tr2:AudioSource token="AudioSourceConfig_1"><tt:Name>Microphone</tt:Name><tt:UseCount>1</tt:UseCount><tt:SourceToken>AudioSource_1</tt:SourceToken></tr2:AudioSource>
+        <tr2:AudioEncoder token="AudioEncoderConfig_1"><tt:Name>G711_PCMU</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>G711</tt:Encoding><tt:Bitrate>64</tt:Bitrate><tt:SampleRate>8</tt:SampleRate></tr2:AudioEncoder>"#
+        } else {
+            ""
+        };
+        let back_xml = if meta.backchannel_enabled {
+            r#"<tr2:AudioOutput token="AudioOutputConfig_1"><tt:Name>POSBackchannel</tt:Name><tt:UseCount>1</tt:UseCount><tt:OutputToken>AudioOutput_1</tt:OutputToken><tt:SendPrimacy>www.onvif.org/ver20/HalfDuplex/Server</tt:SendPrimacy><tt:OutputLevel>100</tt:OutputLevel></tr2:AudioOutput>"#
+        } else {
+            ""
+        };
+        inner.push_str(&format!(
+            r#"<tr2:Profiles token="{token}" fixed="true">
+      <tr2:Name>{name}</tr2:Name>
+      <tr2:Configurations>
+        <tr2:VideoSource token="VideoSourceConfig_1">
+          <tt:Name>ScreenSourceConfig</tt:Name>
+          <tt:UseCount>2</tt:UseCount>
+          <tt:SourceToken>VideoSource_1</tt:SourceToken>
+          <tt:Bounds x="0" y="0" width="{src_w}" height="{src_h}"/>
+        </tr2:VideoSource>
+        <tr2:VideoEncoder token="{enc_token}" GovLength="{gov}" Profile="Main">
+          <tt:Name>{name}{enc}</tt:Name>
+          <tt:UseCount>1</tt:UseCount>
+          <tt:Encoding>{enc}</tt:Encoding>
+          <tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>
+          <tt:RateControl ConstantBitRate="false">
+            <tt:FrameRateLimit>{fps}</tt:FrameRateLimit>
+            <tt:BitrateLimit>{kbps}</tt:BitrateLimit>
+          </tt:RateControl>
+          <tt:Quality>5.0</tt:Quality>
+        </tr2:VideoEncoder>
+        {audio_xml}
+        {back_xml}
+      </tr2:Configurations>
+    </tr2:Profiles>"#,
+            token = escape_xml(&p.token),
+            name = escape_xml(&p.name),
+            enc_token = escape_xml(&p.encoder_token),
+            w = p.width,
+            h = p.height,
+            fps = p.fps,
+            kbps = p.bitrate_kbps,
+            gov = p.gov_length,
+        ));
+    }
+    soap_envelope(&format!(
+        "<tr2:GetProfilesResponse>{inner}</tr2:GetProfilesResponse>"
+    ))
+}
+
+#[must_use]
+pub fn media2_get_video_encoder_configurations_response(profiles: &[OnvifMediaProfile]) -> String {
+    let mut inner = String::new();
+    for p in profiles {
+        let enc = encoding_str(p.encoding);
+        inner.push_str(&format!(
+            r#"<tr2:Configurations token="{enc_token}" GovLength="{gov}" Profile="Main">
+        <tt:Name>{name}{enc}</tt:Name>
+        <tt:UseCount>1</tt:UseCount>
+        <tt:Encoding>{enc}</tt:Encoding>
+        <tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>
+        <tt:RateControl><tt:FrameRateLimit>{fps}</tt:FrameRateLimit><tt:BitrateLimit>{kbps}</tt:BitrateLimit></tt:RateControl>
+        <tt:Quality>5.0</tt:Quality>
+      </tr2:Configurations>"#,
+            enc_token = escape_xml(&p.encoder_token),
+            name = escape_xml(&p.name),
+            w = p.width,
+            h = p.height,
+            fps = p.fps,
+            kbps = p.bitrate_kbps,
+            gov = p.gov_length,
+        ));
+    }
+    soap_envelope(&format!(
+        "<tr2:GetVideoEncoderConfigurationsResponse>{inner}</tr2:GetVideoEncoderConfigurationsResponse>"
+    ))
+}
+
+#[must_use]
+pub fn media2_get_video_encoder_configuration_options_response(
+    profiles: &[OnvifMediaProfile],
+) -> String {
+    let mut res_xml = String::new();
+    for p in profiles {
+        res_xml.push_str(&format!(
+            "<tr2:ResolutionsAvailable><tt:Width>{}</tt:Width><tt:Height>{}</tt:Height></tr2:ResolutionsAvailable>",
+            p.width, p.height
+        ));
+    }
+    soap_envelope(&format!(
+        r#"<tr2:GetVideoEncoderConfigurationOptionsResponse>
+      <tr2:Options GovLengthRange="1 120" FrameRatesSupported="5 8 10 15 30" ProfilesSupported="Main Baseline">
+        <tr2:Encoding>H264</tr2:Encoding>
+        <tr2:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tr2:QualityRange>
+        {res_xml}
+        <tr2:BitrateRange><tt:Min>100</tt:Min><tt:Max>12000</tt:Max></tr2:BitrateRange>
+      </tr2:Options>
+      <tr2:Options GovLengthRange="1 120" FrameRatesSupported="5 8 10 15 30" ProfilesSupported="Main">
+        <tr2:Encoding>H265</tr2:Encoding>
+        <tr2:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tr2:QualityRange>
+        {res_xml}
+        <tr2:BitrateRange><tt:Min>100</tt:Min><tt:Max>12000</tt:Max></tr2:BitrateRange>
+      </tr2:Options>
+    </tr2:GetVideoEncoderConfigurationOptionsResponse>"#
+    ))
+}
+
+#[must_use]
+pub fn media2_get_stream_uri_response(rtsp_uri: &str) -> String {
+    soap_envelope(&format!(
+        "<tr2:GetStreamUriResponse><tr2:Uri>{}</tr2:Uri></tr2:GetStreamUriResponse>",
+        escape_xml(rtsp_uri)
+    ))
+}
+
+#[must_use]
+pub fn media2_get_snapshot_uri_response(snapshot_uri: &str) -> String {
+    soap_envelope(&format!(
+        "<tr2:GetSnapshotUriResponse><tr2:Uri>{}</tr2:Uri></tr2:GetSnapshotUriResponse>",
+        escape_xml(snapshot_uri)
+    ))
+}
+
+#[must_use]
+pub fn get_event_properties_response() -> String {
+    soap_envelope(
+        r#"<tev:GetEventPropertiesResponse>
+      <tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/topicns.xml</tev:TopicNamespaceLocation>
+      <wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>
+      <wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>
+      <tev:MessageContentFilterDialect>http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter</tev:MessageContentFilterDialect>
+      <wstop:TopicSet xmlns:wstop="http://docs.oasis-open.org/wsn/t-1">
+        <tns1:VideoSource wstop:topic="false">
+          <MotionAlarm wstop:topic="true"/>
+        </tns1:VideoSource>
+        <tns1:RuleEngine wstop:topic="false">
+          <PosEvent wstop:topic="false">
+            <Alert wstop:topic="true"/>
+          </PosEvent>
+        </tns1:RuleEngine>
+      </wstop:TopicSet>
+    </tev:GetEventPropertiesResponse>"#,
+    )
+}
+
+#[must_use]
+pub fn create_pull_point_subscription_response(subscription_addr: &str) -> String {
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let term = (Utc::now() + chrono::TimeDelta::minutes(10)).format("%Y-%m-%dT%H:%M:%SZ");
+    soap_envelope(&format!(
+        r#"<tev:CreatePullPointSubscriptionResponse>
+      <tev:SubscriptionReference>
+        <wsa:Address>{}</wsa:Address>
+      </tev:SubscriptionReference>
+      <wsnt:CurrentTime>{now}</wsnt:CurrentTime>
+      <wsnt:TerminationTime>{term}</wsnt:TerminationTime>
+    </tev:CreatePullPointSubscriptionResponse>"#,
+        escape_xml(subscription_addr)
+    ))
+}
+
+#[must_use]
+pub fn pull_messages_response(events: &[OnvifEventRecord]) -> String {
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let term = (Utc::now() + chrono::TimeDelta::minutes(10)).format("%Y-%m-%dT%H:%M:%SZ");
+    let mut msgs_xml = String::new();
+    for ev in events {
+        msgs_xml.push_str(&format!(
+            r#"<wsnt:NotificationMessage>
+        <wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">{topic}</wsnt:Topic>
+        <wsnt:Message>
+          <tt:Message UtcTime="{utc}" PropertyOperation="Changed">
+            <tt:Source><tt:SimpleItem Name="{src_name}" Value="{src_val}"/></tt:Source>
+            <tt:Data><tt:SimpleItem Name="{data_name}" Value="{data_val}"/></tt:Data>
+          </tt:Message>
+        </wsnt:Message>
+      </wsnt:NotificationMessage>"#,
+            topic = escape_xml(&ev.topic),
+            utc = escape_xml(&ev.utc_time),
+            src_name = escape_xml(&ev.source_name),
+            src_val = escape_xml(&ev.source_value),
+            data_name = escape_xml(&ev.data_name),
+            data_val = escape_xml(&ev.data_value),
+        ));
+    }
+    soap_envelope(&format!(
+        r#"<tev:PullMessagesResponse>
+      <tev:CurrentTime>{now}</tev:CurrentTime>
+      <tev:TerminationTime>{term}</tev:TerminationTime>
+      {msgs_xml}
+    </tev:PullMessagesResponse>"#
+    ))
+}
+
+#[must_use]
+pub fn renew_subscription_response() -> String {
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let term = (Utc::now() + chrono::TimeDelta::minutes(10)).format("%Y-%m-%dT%H:%M:%SZ");
+    soap_envelope(&format!(
+        r#"<wsnt:RenewResponse>
+      <wsnt:TerminationTime>{term}</wsnt:TerminationTime>
+      <wsnt:CurrentTime>{now}</wsnt:CurrentTime>
+    </wsnt:RenewResponse>"#
+    ))
+}
+
+#[must_use]
+pub fn unsubscribe_response() -> String {
+    soap_envelope("<wsnt:UnsubscribeResponse/>")
+}
+
+#[must_use]
+pub fn set_synchronization_point_response() -> String {
+    soap_envelope("<tev:SetSynchronizationPointResponse/>")
 }
 
 fn escape_xml(input: &str) -> String {

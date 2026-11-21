@@ -4,7 +4,7 @@
 
 Designed primarily for **Point-of-Sale (POS) visual auditing** and unattended 24/7 operation, NVRDesk focuses on minimal CPU/RAM usage, zero-idle encoding, and clear operator activity overlays.
 
-## Current Status: Phase 2 (Daemon, Embedded Web UI, System Tray, Webcam/Mic & Local Recording)
+## Current Status: Phase 3 (POS Dynamic OSD, Privacy Masks, ONVIF Profile T, TLS & Events)
 
 - [x] **Phase 0:** Cargo workspace, cross-platform CI (Windows/Linux/macOS), screen+cursor capture (`xcap`), SIMD I420 (`yuvutils-rs`), `openh264`, RTSP 1.0 + RFC 6184 RTP
 - [x] **Phase 1:**
@@ -15,12 +15,18 @@ Designed primarily for **Point-of-Sale (POS) visual auditing** and unattended 24
   - **ONVIF Profile S** server (`nvrdesk-onvif`): WS-Discovery (`239.255.255.250:3702`), WS-Security (`PasswordDigest`), Device & Media SOAP services, and HTTP JPEG snapshots (`/snapshot/main`, `/snapshot/sub`)
   - TOML configuration (`--config nvrdesk.toml` / `--print-config`)
 - [x] **Phase 2:**
-  - **Daemon & Embedded Web UI** (`nvrdesk-daemon` + `web-ui/` via `rust-embed` sharing HTTP port `8080`): live MJPEG preview (`/preview/main`, `/preview/sub`), telemetry/status (`/api/v1/status`), hardware device inventory (`/api/v1/devices`), live config save & hot-reload (`/api/v1/config`), and pause/resume controls
-  - **System Tray** (`nvrdesk-tray` via `tray-icon` + Linux `ksni`): Open Web UI, Pause/Resume streaming, and Quit across Windows, Linux, and macOS
-  - **Encoder Backends** (`nvrdesk-codec`): `OpenH264` software fallback + optional external **FFmpeg CLI/pipe backend** (`--encoder auto|openh264|ffmpeg`) with auto-probed OS hardware acceleration (`h264_videotoolbox`, `h264_nvenc`, `h264_qsv`, `h264_amf`, `h264_vaapi`, `libx264`)
-  - **Webcam & Microphone**: Optional `nokhwa` webcam capture (Picture-in-Picture overlay or dedicated `/webcam` RTSP channel) + `cpal` microphone capture encoded to G.711 `PCMU`/`PCMA` (`trackID=1` in RTSP SDP)
+  - **Daemon & Embedded Web UI** (`nvrdesk-daemon` + `web-ui/` via `rust-embed` sharing HTTP port `8080`): live MJPEG preview (`/preview/main`, `/preview/sub`, `/preview/webcam`), telemetry (`/api/v1/status`), hardware device inventory (`/api/v1/devices`), live hot-reload (`/api/v1/config`), and pause/resume controls
+  - **System Tray** (`nvrdesk-tray` via `tray-icon` + Linux `ksni`): Open Web UI, Pause/Resume streaming, Quit, and live show/hide toggle from Web UI
+  - **Encoder Backends** (`nvrdesk-codec`): `OpenH264` software fallback + optional external **FFmpeg CLI/pipe backend** (`--encoder auto|openh264|ffmpeg`) with OS hardware acceleration
+  - **Webcam & Microphone**: Optional `nokhwa` webcam capture (Picture-in-Picture or hot-registered `/webcam` RTSP channel) + `cpal` microphone G.711 `PCMU`/`PCMA` (`trackID=1`)
   - **Local Ring-Buffer Recorder**: Segmented Annex-B `.h264` recording (`--record`) with automatic disk quota eviction
-- [ ] **Phase 3:** POS dynamic text OSD API, ONVIF Profile T (H.265/HTTPS/RTSPS), Motion/Events
+- [x] **Phase 3:**
+  - **Dynamic POS OSD API & Privacy Masks**: `POST /api/v1/osd/text`, `GET/DELETE /api/v1/osd/text`, WebSocket `/api/v1/ws/osd`, and normalized screen privacy masks (`pos.privacy_masks`) rendered before encoding & snapshots
+  - **ONVIF Profile T (`Media2`) & H.265/HEVC**: `/onvif/media2_service` (`tr2:*`), RFC 7798 H.265 RTP packetizer + SDP (`sprop-vps/sps/pps`), and FFmpeg HEVC hardware/software encoding (`--codec h265`)
+  - **Pure-Rust TLS Encryption (`rustls` + `rcgen`)**: optional **HTTPS** (`--https`) for Web UI / WebSocket / ONVIF SOAP and **RTSPS** (`--rtsps` on port `8322`) with self-signed SAN cert or custom PEM cert/key
+  - **Audio Backchannel (VMS -> POS)**: ONVIF `a=recvonly` `trackID=2` over TCP interleaved / UDP decoded from G.711 PCMU/PCMA to `cpal` speaker output (`--backchannel`)
+  - **Motion Detection & ONVIF Events (`PullPointSubscription`)**: frame-delta activity detector + `/onvif/events_service` (`CreatePullPointSubscription`, `PullMessages`, `Renew`, `Unsubscribe`) for `MotionAlarm` and `PosEvent`
+  - **Release Packaging Workflow**: [release.yml](.github/workflows/release.yml) for `.deb`/`.tar.gz` (Linux), `.dmg` (macOS), and `.msi`/`.zip` (Windows)
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical plan.
 
@@ -28,15 +34,15 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical plan.
 
 ```text
 crates/
-├── nvrdesk-core       # Domain types, TOML config schema, overlay snapshots, device inventory
-├── nvrdesk-capture    # Cross-platform screen+cursor (xcap), webcam (nokhwa), audio (cpal) & test pattern
+├── nvrdesk-core       # Domain types, TOML config schema, TLS cert builder, overlay snapshots, errors
+├── nvrdesk-capture    # Cross-platform screen+cursor (xcap), webcam (nokhwa), audio in/out (cpal)
 ├── nvrdesk-input      # Global keyboard/mouse hook (rdevin), coordinate mapping & POS privacy rules
-├── nvrdesk-pipeline   # Frame scaling, webcam PiP, AA click ripples, Noto Sans Mono OSD, JPEG & SIMD I420
-├── nvrdesk-codec      # VideoEncoder (OpenH264 + optional FFmpeg HW/CLI pipe) & G.711 PCMU/PCMA audio encoder
-├── nvrdesk-rtsp       # Multi-stream RTSP 1.0 server (H.264 + G.711 audio), HTTP Digest auth & RTP packetizers
-├── nvrdesk-onvif      # WS-Discovery (UDP 3702), WS-Security, Device/Media SOAP & JPEG snapshots
-├── nvrdesk-daemon     # Daemon runtime, hot-reload worker, RingRecorder & Axum Embedded Web UI + REST API
-├── nvrdesk-tray       # Cross-platform System Tray menu (Open Web UI, Pause/Resume, Quit)
+├── nvrdesk-pipeline   # Scaling, privacy masks, webcam PiP, click/POS OSD, motion detector, JPEG & I420
+├── nvrdesk-codec      # VideoEncoder (OpenH264 + optional FFmpeg H.264/H.265) & G.711 encode/decode
+├── nvrdesk-rtsp       # Multi-stream RTSP/RTSPS server, RFC 6184/7798 RTP & G.711 backchannel
+├── nvrdesk-onvif      # WS-Discovery, WS-Security, Device/Media/Media2/Events PullPoint & snapshots
+├── nvrdesk-daemon     # Daemon runtime, POS OSD REST/WS API, RingRecorder & HTTPS/HTTP Web UI
+├── nvrdesk-tray       # Cross-platform System Tray menu with live show/hide toggle
 └── nvrdesk-cli        # CLI & tray orchestrator (`nvrdesk`)
 ```
 
@@ -72,14 +78,14 @@ cargo run --release -p nvrdesk-cli -- --config nvrdesk.toml
 
 ### Endpoints
 
-- **Embedded Web UI:** `http://<host>:8080/`
-- **Live MJPEG Preview:** `http://<host>:8080/preview/main` and `http://<host>:8080/preview/sub`
-- **REST API:** `/api/v1/status`, `/api/v1/devices`, `/api/v1/config`, `/api/v1/control/pause`, `/api/v1/control/resume`
-- **MainStream RTSP:** `rtsp://<host>:8554/stream1` (alias `/stream`)
+- **Embedded Web UI:** `http(s)://<host>:8080/`
+- **Live MJPEG Preview:** `http(s)://<host>:8080/preview/main`, `/preview/sub`, `/preview/webcam`
+- **REST & WebSocket API:** `/api/v1/status`, `/api/v1/devices`, `/api/v1/config`, `/api/v1/osd/text`, `ws://<host>:8080/api/v1/ws/osd`, `/api/v1/events`, `/api/v1/control/pause`, `/api/v1/control/resume`
+- **MainStream RTSP / RTSPS:** `rtsp://<host>:8554/stream1` (alias `/stream`), `rtsps://<host>:8322/stream1` (with `--rtsps`)
 - **SubStream RTSP:** `rtsp://<host>:8554/stream2`
-- **Webcam Channel RTSP:** `rtsp://<host>:8554/webcam` (when `--webcam --webcam-mode channel`)
-- **ONVIF Device Service:** `http://<host>:8080/onvif/device_service`
-- **HTTP Snapshots:** `http://<host>:8080/snapshot/main` and `http://<host>:8080/snapshot/sub`
+- **Webcam Channel RTSP:** `rtsp://<host>:8554/webcam`
+- **ONVIF Services:** `/onvif/device_service`, `/onvif/media_service`, `/onvif/media2_service` (Profile T), `/onvif/events_service` (PullPoint)
+- **HTTP Snapshots:** `http(s)://<host>:8080/snapshot/main`, `/snapshot/sub`, `/snapshot/webcam`
 
 ### Key CLI Flags
 
@@ -88,17 +94,21 @@ cargo run --release -p nvrdesk-cli -- --config nvrdesk.toml
 | `--config` | none | Load (or create) settings in a TOML config file |
 | `--print-config` | `false` | Print effective TOML configuration and exit |
 | `--port` | `8554` | RTSP listening port |
-| `--http-port` | `8080` | HTTP port for Embedded Web UI, REST API, ONVIF SOAP & Snapshots |
+| `--http-port` | `8080` | HTTP/HTTPS port for Web UI, REST/WS API, ONVIF SOAP & Snapshots |
+| `--https` / `--rtsps` | `false` | Enable TLS encryption on HTTP (HTTPS) and RTSP (`--rtsps-port 8322`) |
 | `--source` | `screen` | Capture source (`screen` or `test-pattern`) |
 | `--display` | `0` | Display index when using `screen` |
+| `--codec` | `h264` | MainStream video codec (`h264` or `h265` via FFmpeg HEVC) |
 | `--encoder` | `auto` | Video encoder backend (`auto`, `openh264`, or `ffmpeg`) |
-| `--ffmpeg-path` / `--ffmpeg-codec` | auto | Custom FFmpeg binary path and codec (e.g. `h264_videotoolbox`, `h264_nvenc`) |
+| `--ffmpeg-path` / `--ffmpeg-codec` | auto | Custom FFmpeg binary path and codec (e.g. `h264_videotoolbox`, `hevc_nvenc`) |
 | `--fps` | `15` | MainStream target FPS |
 | `--bitrate` | `2000000` | MainStream target bitrate in bps |
 | `--max-width` | `1920` | MainStream max output width |
 | `--keystroke-mode` | `masked-digits` | Keystroke OSD mode (`all`, `shortcuts-and-special`, `masked-digits`, `off`) |
 | `--webcam` / `--webcam-mode` | `false` / `pip` | Enable webcam (`pip` overlay or `channel` at `/webcam`) |
 | `--audio` / `--audio-codec` | `false` / `pcmu` | Enable microphone audio (`pcmu` or `pcma` on `trackID=1`) |
+| `--backchannel` | `false` | Enable ONVIF audio backchannel (`trackID=2` VMS -> POS speakers) |
+| `--no-motion` | `false` | Disable motion detection ONVIF events |
 | `--record` / `--record-dir` | `false` / `recordings` | Enable local ring-buffer `.h264` recording |
 | `--no-tray` / `--no-web-ui` | `false` | Disable System Tray (headless) or Embedded Web UI |
 | `--no-substream` / `--no-overlays` / `--no-onvif` | `false` | Disable SubStream, input overlays, or ONVIF |

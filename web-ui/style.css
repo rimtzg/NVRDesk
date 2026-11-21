@@ -125,13 +125,37 @@ label.checkbox-row {
   color: var(--text);
   padding-bottom: 6px;
 }
-input, select {
+input, select, textarea {
   background: #101620;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
   font-size: 0.88rem;
+  font-family: inherit;
+}
+.full-span { grid-column: 1 / -1; }
+.subhead { margin: 14px 0 8px; font-size: 0.92rem; }
+.osd-box { display: flex; flex-direction: column; gap: 8px; }
+.osd-actions { display: flex; gap: 8px; align-items: center; }
+.btn-sm { padding: 6px 10px; font-size: 0.8rem; }
+.events-feed {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.event-row {
+  background: #101620;
+  padding: 5px 8px;
+  border-radius: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
 }
 .select-sm { padding: 4px 8px; font-size: 0.82rem; }
 .divider { grid-column: 1 / -1; border: 0; border-top: 1px solid var(--border); margin: 4px 0; }

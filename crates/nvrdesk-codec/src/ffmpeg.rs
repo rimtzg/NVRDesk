@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bytes::Bytes;
-use nvrdesk_core::{EncodedFrame, I420Frame, NvrDeskError, StreamConfig};
+use nvrdesk_core::{EncodedFrame, I420Frame, NvrDeskError, StreamConfig, VideoCodecKind};
 use tracing::{debug, info, warn};
 
 use crate::{VideoEncoder, split_annex_b_nals};
@@ -15,6 +15,41 @@ use crate::{VideoEncoder, split_annex_b_nals};
 /// Probes `ffmpeg_path` for hardware H.264 encoders suitable for the current OS.
 #[must_use]
 pub fn probe_hw_h264_codec(ffmpeg_path: &str) -> Option<&'static str> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["h264_videotoolbox"]
+    } else if cfg!(target_os = "windows") {
+        &["h264_nvenc", "h264_qsv", "h264_amf"]
+    } else {
+        &["h264_nvenc", "h264_vaapi", "h264_qsv"]
+    };
+    probe_codec_candidates(ffmpeg_path, candidates, "H.264")
+}
+
+/// Probes `ffmpeg_path` for hardware H.265 (HEVC) encoders suitable for the current OS.
+#[must_use]
+pub fn probe_hw_h265_codec(ffmpeg_path: &str) -> Option<&'static str> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["hevc_videotoolbox"]
+    } else if cfg!(target_os = "windows") {
+        &["hevc_nvenc", "hevc_qsv", "hevc_amf"]
+    } else {
+        &["hevc_nvenc", "hevc_vaapi", "hevc_qsv"]
+    };
+    probe_codec_candidates(ffmpeg_path, candidates, "H.265")
+}
+
+/// Probes `ffmpeg_path` for any working H.265 encoder (hardware first, then `libx265`).
+#[must_use]
+pub fn probe_any_h265_codec(ffmpeg_path: &str) -> Option<&'static str> {
+    probe_hw_h265_codec(ffmpeg_path)
+        .or_else(|| probe_codec_candidates(ffmpeg_path, &["libx265"], "H.265"))
+}
+
+fn probe_codec_candidates(
+    ffmpeg_path: &str,
+    candidates: &[&'static str],
+    family: &str,
+) -> Option<&'static str> {
     let output = Command::new(ffmpeg_path)
         .args(["-hide_banner", "-encoders"])
         .stdout(Stdio::piped())
@@ -26,17 +61,9 @@ pub fn probe_hw_h264_codec(ffmpeg_path: &str) -> Option<&'static str> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
 
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &["h264_videotoolbox"]
-    } else if cfg!(target_os = "windows") {
-        &["h264_nvenc", "h264_qsv", "h264_amf"]
-    } else {
-        &["h264_nvenc", "h264_vaapi", "h264_qsv"]
-    };
-
     for &codec in candidates {
         if text.contains(codec) && validate_codec_smoke(ffmpeg_path, codec) {
-            info!(codec, "detected working FFmpeg hardware H.264 encoder");
+            info!(codec, family, "detected working FFmpeg encoder");
             return Some(codec);
         }
     }
@@ -67,34 +94,43 @@ fn validate_codec_smoke(ffmpeg_path: &str, codec: &str) -> bool {
     cmd.status().is_ok_and(|s| s.success())
 }
 
-/// External FFmpeg CLI pipe encoder supporting hardware and custom codecs.
+/// External FFmpeg CLI pipe encoder supporting H.264 and H.265 hardware/software codecs.
 pub struct FfmpegCliEncoder {
     ffmpeg_path: String,
     codec: String,
+    video_kind: VideoCodecKind,
     cfg: StreamConfig,
     dimensions: Option<(u32, u32)>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     au_rx: Option<mpsc::Receiver<Vec<Bytes>>>,
     reader_thread: Option<JoinHandle<()>>,
+    cached_vps: Option<Bytes>,
     cached_sps: Option<Bytes>,
     cached_pps: Option<Bytes>,
     last_pts_90khz: u64,
 }
 
 impl FfmpegCliEncoder {
-    /// Creates a new external FFmpeg pipe encoder with `codec` (e.g. `h264_videotoolbox`).
+    /// Creates a new external FFmpeg pipe encoder with `codec` (e.g. `h264_videotoolbox`, `hevc_nvenc`).
     #[must_use]
     pub fn new(ffmpeg_path: String, codec: String, cfg: &StreamConfig) -> Self {
+        let video_kind = if codec.contains("hevc") || codec.contains("265") {
+            VideoCodecKind::H265
+        } else {
+            cfg.codec
+        };
         Self {
             ffmpeg_path,
             codec,
+            video_kind,
             cfg: cfg.clone(),
             dimensions: None,
             child: None,
             stdin: None,
             au_rx: None,
             reader_thread: None,
+            cached_vps: None,
             cached_sps: None,
             cached_pps: None,
             last_pts_90khz: 0,
@@ -139,7 +175,7 @@ impl FfmpegCliEncoder {
             "0".to_string(),
         ];
 
-        if self.codec == "libx264" {
+        if self.codec == "libx264" || self.codec == "libx265" {
             args.extend([
                 "-preset".into(),
                 "ultrafast".into(),
@@ -153,11 +189,17 @@ impl FfmpegCliEncoder {
                 "-profile:v".into(),
                 "baseline".into(),
             ]);
+        } else if self.codec == "hevc_videotoolbox" {
+            args.extend(["-realtime".into(), "true".into()]);
         }
 
+        let annex_b_muxer = match self.video_kind {
+            VideoCodecKind::H264 => "h264",
+            VideoCodecKind::H265 => "hevc",
+        };
         args.extend([
             "-f".to_string(),
-            "h264".to_string(),
+            annex_b_muxer.to_string(),
             "-flush_packets".to_string(),
             "1".to_string(),
             "pipe:1".to_string(),
@@ -260,16 +302,27 @@ impl VideoEncoder for FfmpegCliEncoder {
             if nal.is_empty() {
                 continue;
             }
-            match nal[0] & 0x1F {
-                7 => self.cached_sps = Some(nal.clone()),
-                8 => self.cached_pps = Some(nal.clone()),
-                5 => is_keyframe = true,
-                _ => {}
+            match self.video_kind {
+                VideoCodecKind::H264 => match nal[0] & 0x1F {
+                    7 => self.cached_sps = Some(nal.clone()),
+                    8 => self.cached_pps = Some(nal.clone()),
+                    5 => is_keyframe = true,
+                    _ => {}
+                },
+                VideoCodecKind::H265 => match (nal[0] >> 1) & 0x3F {
+                    32 => self.cached_vps = Some(nal.clone()),
+                    33 => self.cached_sps = Some(nal.clone()),
+                    34 => self.cached_pps = Some(nal.clone()),
+                    19..=21 => is_keyframe = true,
+                    _ => {}
+                },
             }
         }
 
         Ok(EncodedFrame {
+            codec: self.video_kind,
             nals: collected_nals,
+            vps: self.cached_vps.clone(),
             sps: self.cached_sps.clone(),
             pps: self.cached_pps.clone(),
             is_keyframe,
@@ -279,6 +332,10 @@ impl VideoEncoder for FfmpegCliEncoder {
 
     fn parameter_sets(&self) -> (Option<Bytes>, Option<Bytes>) {
         (self.cached_sps.clone(), self.cached_pps.clone())
+    }
+
+    fn vps(&self) -> Option<Bytes> {
+        self.cached_vps.clone()
     }
 }
 

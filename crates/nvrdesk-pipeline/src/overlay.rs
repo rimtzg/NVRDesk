@@ -5,7 +5,10 @@ use fast_image_resize::{
     images::{Image, ImageRef},
 };
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
-use nvrdesk_core::{InputOverlaySnapshot, MouseButton, PipPosition, PixelFormat, RawVideoFrame};
+use nvrdesk_core::{
+    InputOverlaySnapshot, MouseButton, PipPosition, PixelFormat, PosOsdLevel, PosOsdLine,
+    PosOverlaySnapshot, PrivacyMaskRect, RawVideoFrame,
+};
 
 /// Composites a webcam frame as Picture-in-Picture onto `buf` in the specified corner.
 #[allow(clippy::too_many_arguments)]
@@ -249,7 +252,36 @@ fn draw_keystroke_pill(
 
     let text_x = box_x + pad_x;
     let text_y = box_y + pad_y;
-    for (i, ch) in chars.into_iter().enumerate() {
+    draw_text_run(
+        buf,
+        width,
+        height,
+        stride,
+        format,
+        &chars,
+        text_x,
+        text_y,
+        char_w,
+        raster_h,
+        [245, 248, 255],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_run(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: PixelFormat,
+    chars: &[char],
+    text_x: usize,
+    text_y: usize,
+    char_w: usize,
+    raster_h: RasterHeight,
+    rgb: [u8; 3],
+) {
+    for (i, &ch) in chars.iter().enumerate() {
         let glyph = get_raster(ch, FontWeight::Bold, raster_h)
             .or_else(|| get_raster('?', FontWeight::Bold, raster_h));
         let Some(raster) = glyph else { continue };
@@ -265,11 +297,194 @@ fn draw_keystroke_pill(
                 }
                 let px = gx + rx;
                 if px < width as usize {
-                    blend_pixel(buf, stride, format, px, py, [245, 248, 255, intensity]);
+                    blend_pixel(
+                        buf,
+                        stride,
+                        format,
+                        px,
+                        py,
+                        [rgb[0], rgb[1], rgb[2], intensity],
+                    );
                 }
             }
         }
     }
+}
+
+/// Applies solid opaque privacy masks to normalized frame regions before overlays and encoding.
+pub fn apply_privacy_masks(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: PixelFormat,
+    masks: &[PrivacyMaskRect],
+) {
+    if width == 0 || height == 0 || masks.is_empty() {
+        return;
+    }
+    let w_f = width as f32;
+    let h_f = height as f32;
+
+    for mask in masks {
+        let x0 = (mask.x.clamp(0.0, 1.0) * w_f).floor() as usize;
+        let y0 = (mask.y.clamp(0.0, 1.0) * h_f).floor() as usize;
+        let mw = (mask.width.clamp(0.0, 1.0) * w_f).ceil() as usize;
+        let mh = (mask.height.clamp(0.0, 1.0) * h_f).ceil() as usize;
+        if mw == 0 || mh == 0 {
+            continue;
+        }
+        fill_rect_blend(
+            buf,
+            width,
+            height,
+            stride,
+            format,
+            x0,
+            y0,
+            mw,
+            mh,
+            [15, 23, 42, 255],
+        );
+
+        if let Some(label) = mask
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let raster_h = RasterHeight::Size16;
+            let char_w = get_raster_width(FontWeight::Bold, raster_h);
+            let max_chars = mw.saturating_sub(12) / char_w;
+            if max_chars >= 2 && mh >= 22 {
+                let chars: Vec<char> = label.chars().take(max_chars).collect();
+                let lx = x0 + 6;
+                let ly = y0 + (mh.saturating_sub(16)) / 2;
+                draw_text_run(
+                    buf,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    &chars,
+                    lx,
+                    ly,
+                    char_w,
+                    raster_h,
+                    [148, 163, 184],
+                );
+            }
+        }
+    }
+}
+
+/// Renders active dynamic POS OSD lines onto `buf` at `position`.
+pub fn draw_pos_osd(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: PixelFormat,
+    lines: &[PosOsdLine],
+    position: PipPosition,
+) {
+    if width < 160 || height < 120 || lines.is_empty() {
+        return;
+    }
+
+    let raster_h = if width >= 1200 {
+        RasterHeight::Size24
+    } else {
+        RasterHeight::Size16
+    };
+    let char_h = raster_h.val();
+    let char_w = get_raster_width(FontWeight::Bold, raster_h);
+    let pad_x = if width >= 1200 { 14 } else { 10 };
+    let pad_y = if width >= 1200 { 8 } else { 6 };
+    let line_gap = 6usize;
+    let margin = ((width.min(height) as usize) / 40).max(10);
+    let max_chars = ((width as usize).saturating_sub(margin * 2 + pad_x * 2 + 12) / char_w).max(8);
+
+    let mut cur_y = match position {
+        PipPosition::TopLeft | PipPosition::TopRight => margin,
+        PipPosition::BottomLeft | PipPosition::BottomRight => {
+            let total_h =
+                lines.len() * (char_h + pad_y * 2) + lines.len().saturating_sub(1) * line_gap;
+            (height as usize).saturating_sub(margin + total_h)
+        }
+    };
+
+    for line in lines {
+        let chars: Vec<char> = line.text.chars().take(max_chars).collect();
+        if chars.is_empty() {
+            continue;
+        }
+        let box_w = chars.len() * char_w + pad_x * 2 + 6;
+        let box_h = char_h + pad_y * 2;
+        let box_x = match position {
+            PipPosition::TopLeft | PipPosition::BottomLeft => margin,
+            PipPosition::TopRight | PipPosition::BottomRight => {
+                (width as usize).saturating_sub(margin + box_w)
+            }
+        };
+
+        fill_rect_blend(
+            buf,
+            width,
+            height,
+            stride,
+            format,
+            box_x,
+            cur_y,
+            box_w,
+            box_h,
+            [14, 18, 26, 215],
+        );
+
+        let accent = match line.level {
+            PosOsdLevel::Info => [59, 130, 246, 255],
+            PosOsdLevel::Warning => [245, 158, 11, 255],
+            PosOsdLevel::Alert => [239, 68, 68, 255],
+        };
+        fill_rect_blend(
+            buf, width, height, stride, format, box_x, cur_y, 4, box_h, accent,
+        );
+
+        draw_text_run(
+            buf,
+            width,
+            height,
+            stride,
+            format,
+            &chars,
+            box_x + pad_x + 4,
+            cur_y + pad_y,
+            char_w,
+            raster_h,
+            [248, 250, 252],
+        );
+        cur_y += box_h + line_gap;
+    }
+}
+
+/// Renders privacy masks and dynamic POS OSD lines onto `buf` from `pos_snap`.
+pub fn draw_pos_snapshot(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: PixelFormat,
+    pos_snap: &PosOverlaySnapshot,
+) {
+    draw_pos_osd(
+        buf,
+        width,
+        height,
+        stride,
+        format,
+        &pos_snap.lines,
+        pos_snap.osd_position,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,5 +645,41 @@ mod tests {
         let check_y = 40;
         let idx = (check_y * 640 + check_x) * 4;
         assert_eq!(dst[idx], 200);
+    }
+
+    #[test]
+    fn applies_privacy_masks_and_draws_pos_osd() {
+        let mut buf = vec![255u8; 640 * 360 * 4];
+        let masks = [PrivacyMaskRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.25,
+            height: 0.2,
+            label: Some("PIN".to_string()),
+        }];
+        apply_privacy_masks(&mut buf, 640, 360, 640 * 4, PixelFormat::Rgba8, &masks);
+        // Pixel inside masked area must be overwritten from 255 -> 15 (R channel of #0F172A).
+        assert_eq!(buf[0], 15);
+        // Pixel outside masked area remains white (255).
+        let unmasked_idx = (200 * 640 + 400) * 4;
+        assert_eq!(buf[unmasked_idx], 255);
+
+        let lines = [PosOsdLine {
+            slot: "ticket".into(),
+            text: "Ticket #1042 $95.00".into(),
+            level: PosOsdLevel::Warning,
+        }];
+        draw_pos_osd(
+            &mut buf,
+            640,
+            360,
+            640 * 4,
+            PixelFormat::Rgba8,
+            &lines,
+            PipPosition::BottomRight,
+        );
+        // Bottom-right region was modified by the POS OSD pill.
+        let osd_idx = (335 * 640 + 550) * 4;
+        assert_ne!(buf[osd_idx], 255);
     }
 }

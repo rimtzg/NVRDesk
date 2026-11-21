@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nvrdesk_capture::{CaptureSource, TestPatternSource};
 use nvrdesk_codec::{OpenH264Encoder, VideoEncoder};
-use nvrdesk_core::{InputOverlayConfig, KeystrokeMode, MouseButton, NvrDeskError, StreamConfig};
+use nvrdesk_core::{
+    InputOverlayConfig, KeystrokeMode, MouseButton, NvrDeskError, StreamConfig, VideoCodecKind,
+};
 use nvrdesk_input::{InputTracker, TrackedEvent};
 use nvrdesk_onvif::{
     OnvifAuthConfig, OnvifDeviceMeta, OnvifMediaProfile, OnvifServer, SnapshotProvider,
@@ -25,6 +27,7 @@ use tokio::net::TcpStream;
 #[tokio::test]
 async fn streams_dual_h264_with_overlays_and_passes_ffprobe() {
     let main_cfg = StreamConfig {
+        codec: VideoCodecKind::H264,
         fps: 15,
         bitrate_bps: 1_000_000,
         max_width: 1280,
@@ -32,6 +35,7 @@ async fn streams_dual_h264_with_overlays_and_passes_ffprobe() {
         show_cursor: true,
     };
     let sub_cfg = StreamConfig {
+        codec: VideoCodecKind::H264,
         fps: 10,
         bitrate_bps: 400_000,
         max_width: 640,
@@ -44,13 +48,12 @@ async fn streams_dual_h264_with_overlays_and_passes_ffprobe() {
             path: "/stream1".to_string(),
             aliases: vec!["/stream".to_string()],
             name: "NVRDesk Main E2E".to_string(),
-            audio_codec: None,
+            ..Default::default()
         },
         RtspStreamSpec {
             path: "/stream2".to_string(),
-            aliases: Vec::new(),
             name: "NVRDesk Sub E2E".to_string(),
-            audio_codec: None,
+            ..Default::default()
         },
     ];
 
@@ -236,17 +239,19 @@ async fn onvif_soap_ws_security_and_snapshot_work_end_to_end() {
         device_name: "Caja 1".into(),
         manufacturer: "NVRDesk".into(),
         model: "Virtual IP Camera".into(),
-        firmware_version: "0.1.0".into(),
+        firmware_version: "0.3.0".into(),
         serial_number: "TEST-01".into(),
         hardware_id: "HW-01".into(),
         rtsp_port: 8554,
         http_port: 0,
+        ..Default::default()
     };
     let profiles = vec![
         OnvifMediaProfile {
             token: "MainProfile".into(),
             name: "MainStream".into(),
             encoder_token: "MainEnc".into(),
+            encoding: VideoCodecKind::H264,
             width: 1920,
             height: 1080,
             fps: 15,
@@ -259,6 +264,7 @@ async fn onvif_soap_ws_security_and_snapshot_work_end_to_end() {
             token: "SubProfile".into(),
             name: "SubStream".into(),
             encoder_token: "SubEnc".into(),
+            encoding: VideoCodecKind::H264,
             width: 640,
             height: 360,
             fps: 8,
@@ -608,9 +614,9 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
         None,
         vec![RtspStreamSpec {
             path: "/av".to_string(),
-            aliases: Vec::new(),
             name: "AV Test".to_string(),
             audio_codec: Some(AudioCodecKind::Pcmu),
+            ..Default::default()
         }],
     )
     .await
@@ -627,6 +633,7 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
     let av_pub = av_handle.clone();
     let feeder = tokio::spawn(async move {
         let mut enc = OpenH264Encoder::new(&StreamConfig {
+            codec: VideoCodecKind::H264,
             fps: 10,
             bitrate_bps: 400_000,
             max_width: 320,
@@ -720,6 +727,214 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
 
     feeder.abort();
     av_task.abort();
+    shutdown.store(true, Ordering::Release);
+    let _ = worker.join();
+}
+
+#[tokio::test]
+async fn phase3_pos_osd_media2_pullpoint_events_rtsps_and_backchannel() {
+    use nvrdesk_core::{CaptureSourceKind, EncoderBackendKind, NvrDeskConfig, PrivacyMaskRect};
+    use nvrdesk_daemon::start_daemon;
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{
+        ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+    };
+
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let mut cfg = NvrDeskConfig::default();
+    cfg.source.kind = CaptureSourceKind::TestPattern;
+    cfg.encoder.backend = EncoderBackendKind::Openh264;
+    cfg.rtsp.bind = "127.0.0.1".to_string();
+    cfg.rtsp.port = 0;
+    cfg.onvif.http_port = 0;
+    cfg.onvif.discovery_enabled = false;
+    cfg.daemon.tray_enabled = false;
+    cfg.input_overlay.enabled = false;
+    cfg.audio.backchannel_enabled = true;
+    cfg.tls.rtsps_enabled = true;
+    cfg.tls.rtsps_port = 0;
+    cfg.pos.privacy_masks = vec![PrivacyMaskRect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.2,
+        height: 0.15,
+        label: Some("PIN".into()),
+    }];
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (handle, worker) = start_daemon(cfg, None, Arc::clone(&shutdown))
+        .await
+        .expect("start_daemon phase3");
+
+    let web_url = handle.web_ui_url();
+    let http_port: u16 = web_url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port);
+    let rtsps_port = handle.rtsps_port().expect("rtsps port bound");
+
+    // 1. Create ONVIF PullPointSubscription before injecting POS OSD event
+    let sub_req = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl"><s:Body><tev:CreatePullPointSubscription/></s:Body></s:Envelope>"#;
+    let sub_resp = send_http(http_addr, "POST", "/onvif/events_service", &[], sub_req).await;
+    assert!(
+        sub_resp.contains("CreatePullPointSubscriptionResponse"),
+        "{sub_resp}"
+    );
+    let sub_addr = sub_resp
+        .split("<wsa:Address>")
+        .nth(1)
+        .and_then(|s| s.split("</wsa:Address>").next())
+        .expect("subscription address");
+    let sub_path = sub_addr
+        .split(&format!(":{http_port}"))
+        .nth(1)
+        .expect("sub path");
+
+    // 2. Dynamic POS OSD API + emit ONVIF PosEvent
+    let osd_post = send_http(
+        http_addr,
+        "POST",
+        "/api/v1/osd/text",
+        &[("Content-Type", "application/json")],
+        r#"{"slot":"ticket","text":"Ticket #8841 | $149.00","level":"warning","emit_event":true}"#,
+    )
+    .await;
+    assert!(osd_post.starts_with("HTTP/1.1 200 OK"), "{osd_post}");
+    assert!(osd_post.contains("Ticket #8841"), "{osd_post}");
+
+    // 3. PullMessages receives the POS event from PullPointSubscription
+    let pull_req = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl"><s:Body><tev:PullMessages><tev:Timeout>PT1S</tev:Timeout><tev:MessageLimit>5</tev:MessageLimit></tev:PullMessages></s:Body></s:Envelope>"#;
+    let pull_resp = send_http(http_addr, "POST", sub_path, &[], pull_req).await;
+    assert!(
+        pull_resp.contains("Ticket #8841"),
+        "missing POS event: {pull_resp}"
+    );
+
+    // 4. ONVIF Profile T Media2 GetProfiles & GetVideoEncoderConfigurationOptions (H264 + H265)
+    let m2_req = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"><s:Body><tr2:GetProfiles/></s:Body></s:Envelope>"#;
+    let m2_resp = send_http(http_addr, "POST", "/onvif/media2_service", &[], m2_req).await;
+    assert!(
+        m2_resp.contains("POSBackchannel"),
+        "missing backchannel in Media2: {m2_resp}"
+    );
+
+    let opt_req = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"><s:Body><tr2:GetVideoEncoderConfigurationOptions/></s:Body></s:Envelope>"#;
+    let opt_resp = send_http(http_addr, "POST", "/onvif/media2_service", &[], opt_req).await;
+    assert!(
+        opt_resp.contains("<tr2:Encoding>H265</tr2:Encoding>"),
+        "{opt_resp}"
+    );
+
+    // 5. Connect over RTSPS (TLS), verify `trackID=2` backchannel SDP & send G.711 backchannel RTP
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let tls_client_cfg = Arc::new(
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth(),
+    );
+    let connector = TlsConnector::from(tls_client_cfg);
+    let tcp = TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), rtsps_port))
+        .await
+        .expect("connect rtsps");
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls handshake");
+
+    let rtsps_url = format!("rtsps://127.0.0.1:{rtsps_port}/stream1");
+    let desc_req = format!("DESCRIBE {rtsps_url} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    tls.write_all(desc_req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tls.read(&mut buf).await.unwrap();
+    let desc_txt = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        desc_txt.contains("a=control:trackID=2"),
+        "missing backchannel in SDP: {desc_txt}"
+    );
+    assert!(
+        desc_txt.contains("a=recvonly"),
+        "expected recvonly backchannel: {desc_txt}"
+    );
+
+    let setup_bc = format!(
+        "SETUP {rtsps_url}/trackID=2 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=4-5\r\n\r\n"
+    );
+    tls.write_all(setup_bc.as_bytes()).await.unwrap();
+    let n = tls.read(&mut buf).await.unwrap();
+    let setup_txt = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(setup_txt.starts_with("RTSP/1.0 200 OK"), "{setup_txt}");
+    let session_id = setup_txt
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("session:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
+        .expect("session");
+
+    let play_bc = format!("PLAY {rtsps_url} RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
+    tls.write_all(play_bc.as_bytes()).await.unwrap();
+    let n = tls.read(&mut buf).await.unwrap();
+    let play_txt = String::from_utf8_lossy(&buf[..n]);
+    assert!(play_txt.starts_with("RTSP/1.0 200 OK"), "{play_txt}");
+
+    // Send 1 TCP-interleaved G.711 PCMU RTP packet on channel 4
+    let mut rtp = vec![b'$', 4, 0, 20];
+    rtp.extend_from_slice(&[0x80, 0x00, 0, 1, 0, 0, 0, 160, 0, 0, 0, 1]);
+    rtp.extend_from_slice(&[0xFF; 8]);
+    tls.write_all(&rtp).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        handle.status().backchannel_packets >= 1,
+        "expected backchannel packet decoded over RTSPS"
+    );
+
     shutdown.store(true, Ordering::Release);
     let _ = worker.join();
 }

@@ -62,10 +62,24 @@
             <strong id="stat-recording">Off</strong>
           </div>
           <div class="stat-box">
-            <span class="stat-label">ONVIF HTTP</span>
+            <span class="stat-label">Security / Profile T</span>
             <strong id="stat-onvif">-</strong>
           </div>
         </div>
+        <h2 class="subhead">POS Dynamic OSD &amp; Events</h2>
+        <div class="osd-box">
+          <input id="osd-text-input" type="text" placeholder="Ticket #1024 | Cajero: Ana | $350.00" />
+          <div class="osd-actions">
+            <select id="osd-level-select" class="select-sm">
+              <option value="info">Info</option>
+              <option value="warning">Warning</option>
+              <option value="alert">Alert</option>
+            </select>
+            <button id="send-osd-btn" type="button" class="btn btn-primary btn-sm">Send OSD</button>
+            <button id="clear-osd-btn" type="button" class="btn btn-secondary btn-sm">Clear</button>
+          </div>
+        </div>
+        <div class="events-feed" id="events-feed"></div>
       </section>
 
       <section class="card config-card">
@@ -77,6 +91,13 @@
           <label>
             Monitor
             <select id="cfg-display"></select>
+          </label>
+          <label>
+            Main Codec (Profile S/T)
+            <select id="cfg-main-codec">
+              <option value="h264">H.264 / AVC (Profile S)</option>
+              <option value="h265">H.265 / HEVC (Profile T)</option>
+            </select>
           </label>
           <label>
             Encoder Backend
@@ -163,6 +184,29 @@
           <label>
             Recording Max Quota (MB)
             <input id="cfg-rec-max-mb" type="number" min="64" step="64" />
+          </label>
+
+          <hr class="divider" />
+
+          <label class="checkbox-row">
+            <input id="cfg-motion-enabled" type="checkbox" />
+            Motion Detection ONVIF Events
+          </label>
+          <label class="checkbox-row">
+            <input id="cfg-backchannel-enabled" type="checkbox" />
+            Audio Backchannel (restart)
+          </label>
+          <label class="checkbox-row">
+            <input id="cfg-https-enabled" type="checkbox" />
+            HTTPS TLS (restart)
+          </label>
+          <label class="checkbox-row">
+            <input id="cfg-rtsps-enabled" type="checkbox" />
+            RTSPS TLS (restart)
+          </label>
+          <label class="full-span">
+            POS Privacy Masks JSON (normalized 0.0-1.0: [{"x":0.7,"y":0.8,"width":0.25,"height":0.15,"label":"PIN"}])
+            <textarea id="cfg-privacy-masks" rows="2"></textarea>
           </label>
         </form>
         <p id="save-msg" class="save-msg"></p>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>NVRDesk</string>
+  <key>CFBundleDisplayName</key>
+  <string>NVRDesk</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.rimtzg.nvrdesk</string>
+  <key>CFBundleVersion</key>
+  <string>0.3.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.3.0</string>
+  <key>CFBundleExecutable</key>
+  <string>nvrdesk</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>NVRDesk captures the screen to stream it over ONVIF/RTSP to your NVR or VMS.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>NVRDesk optionally captures your webcam for Picture-in-Picture or a dedicated RTSP stream.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>NVRDesk optionally captures microphone audio for G.711 RTSP streaming and POS monitoring.</string>
+</dict>
+</plist>

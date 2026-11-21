@@ -1,0 +1,78 @@
+name: Release Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+          - os: macos-latest
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies & cargo-deb
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev libdbus-1-dev libasound2-dev libv4l-dev libwayland-dev libdrm-dev libgbm-dev libegl-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libx11-dev libxtst-dev libxi-dev pkg-config ffmpeg
+          cargo install cargo-deb --locked
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg wixtoolset -y
+
+      - name: Build release binary
+        run: cargo build --release -p nvrdesk-cli
+
+      - name: Package Linux (.deb & .tar.gz)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cargo deb -p nvrdesk-cli --no-build --output dist/
+          tar -czf dist/nvrdesk-${{ matrix.target }}.tar.gz -C target/release nvrdesk
+
+      - name: Package macOS (.dmg)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist NVRDesk.app/Contents/MacOS NVRDesk.app/Contents/Resources
+          cp target/release/nvrdesk NVRDesk.app/Contents/MacOS/nvrdesk
+          cp packaging/macos/Info.plist NVRDesk.app/Contents/Info.plist
+          hdiutil create -volname "NVRDesk" -srcfolder NVRDesk.app -ov -format UDZO dist/NVRDesk-${{ matrix.target }}.dmg
+
+      - name: Package Windows (.zip & .msi)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/nvrdesk.exe -DestinationPath dist/nvrdesk-${{ matrix.target }}.zip -Force
+          cargo install cargo-wix --locked
+          cargo wix --package nvrdesk-cli --init --force
+          cargo wix --package nvrdesk-cli --no-build --output dist/
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvrdesk-${{ matrix.target }}
+          path: dist/*

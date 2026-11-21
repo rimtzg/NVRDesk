@@ -1,5 +1,7 @@
 //! Core domain types, TOML configuration schema, overlay snapshots, and errors for NVRDesk.
 
+pub mod tls;
+
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -119,16 +121,31 @@ impl I420Frame {
     }
 }
 
-/// Encoded H.264 access unit consisting of Annex-B stripped NAL units.
+/// Video compression standard used for a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoCodecKind {
+    /// H.264 / AVC (ONVIF Profile S & universal compatibility).
+    #[default]
+    H264,
+    /// H.265 / HEVC (ONVIF Profile T via hardware encoders / FFmpeg).
+    H265,
+}
+
+/// Encoded H.264 or H.265 access unit consisting of Annex-B stripped NAL units.
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
+    /// Video codec of this access unit.
+    pub codec: VideoCodecKind,
     /// NAL units without Annex-B start codes (`0x000001` / `0x00000001`).
     pub nals: Vec<Bytes>,
-    /// Extracted Sequence Parameter Set (NAL type 7), if present in this access unit.
+    /// Extracted Video Parameter Set (H.265 NAL type 32), if present.
+    pub vps: Option<Bytes>,
+    /// Extracted Sequence Parameter Set (H.264 type 7 / H.265 type 33), if present.
     pub sps: Option<Bytes>,
-    /// Extracted Picture Parameter Set (NAL type 8), if present in this access unit.
+    /// Extracted Picture Parameter Set (H.264 type 8 / H.265 type 34), if present.
     pub pps: Option<Bytes>,
-    /// Whether this access unit contains an IDR keyframe (NAL type 5).
+    /// Whether this access unit contains an IDR/IRAP keyframe.
     pub is_keyframe: bool,
     /// Presentation timestamp on a 90 kHz RTP clock.
     pub pts_90khz: u64,
@@ -148,6 +165,8 @@ pub struct EncodedAudioFrame {
 /// Video stream encoding configuration parameters.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
+    /// Target video codec (`H264` or `H265`).
+    pub codec: VideoCodecKind,
     /// Target frames per second.
     pub fps: u32,
     /// Target bitrate in bits per second.
@@ -163,6 +182,7 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
+            codec: VideoCodecKind::H264,
             fps: 15,
             bitrate_bps: 2_000_000,
             max_width: 1920,
@@ -343,7 +363,110 @@ pub enum AudioCodecKind {
     Pcma,
 }
 
-/// Microphone audio configuration.
+/// Severity level for dynamic POS OSD lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PosOsdLevel {
+    #[default]
+    Info,
+    Warning,
+    Alert,
+}
+
+/// Active dynamic POS text line injected via `POST /api/v1/osd/text` or WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosOsdLine {
+    pub slot: String,
+    pub text: String,
+    pub level: PosOsdLevel,
+}
+
+/// Fixed privacy mask rectangle normalized to `[0.0, 1.0]` frame coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyMaskRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Point-in-time POS OSD & privacy mask snapshot applied to video frames and HTTP snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct PosOverlaySnapshot {
+    pub lines: Vec<PosOsdLine>,
+    pub privacy_masks: Vec<PrivacyMaskRect>,
+    pub osd_position: PipPosition,
+}
+
+/// Dynamic POS OSD & privacy mask configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PosConfig {
+    pub osd_enabled: bool,
+    pub default_ttl_ms: u64,
+    pub osd_position: PipPosition,
+    pub privacy_masks: Vec<PrivacyMaskRect>,
+}
+
+impl Default for PosConfig {
+    fn default() -> Self {
+        Self {
+            osd_enabled: true,
+            default_ttl_ms: 8000,
+            osd_position: PipPosition::TopLeft,
+            privacy_masks: Vec::new(),
+        }
+    }
+}
+
+/// Motion detection configuration for screen/webcam activity ONVIF events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionConfig {
+    pub enabled: bool,
+    /// Normalized average pixel delta threshold in `[0.01, 1.0]` (lower = more sensitive).
+    pub sensitivity: f32,
+    pub min_interval_ms: u64,
+    pub webcam_enabled: bool,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sensitivity: 0.08,
+            min_interval_ms: 3000,
+            webcam_enabled: true,
+        }
+    }
+}
+
+/// TLS encryption settings for HTTPS (Web UI + ONVIF) and RTSPS (`rustls`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    pub https_enabled: bool,
+    pub rtsps_enabled: bool,
+    pub rtsps_port: u16,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            https_enabled: false,
+            rtsps_enabled: false,
+            rtsps_port: 8322,
+            cert_path: None,
+            key_path: None,
+        }
+    }
+}
+
+/// Microphone & backchannel audio configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -351,6 +474,7 @@ pub struct AudioConfig {
     pub device_name: Option<String>,
     pub codec: AudioCodecKind,
     pub sample_rate: u32,
+    pub backchannel_enabled: bool,
 }
 
 impl Default for AudioConfig {
@@ -360,6 +484,7 @@ impl Default for AudioConfig {
             device_name: None,
             codec: AudioCodecKind::Pcmu,
             sample_rate: 8000,
+            backchannel_enabled: false,
         }
     }
 }
@@ -426,6 +551,7 @@ impl Default for SourceConfig {
 #[serde(default)]
 pub struct StreamProfileConfig {
     pub enabled: bool,
+    pub codec: VideoCodecKind,
     pub path: String,
     pub max_width: u32,
     pub fps: u32,
@@ -437,6 +563,7 @@ impl Default for StreamProfileConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            codec: VideoCodecKind::H264,
             path: "/stream1".to_string(),
             max_width: 1920,
             fps: 15,
@@ -451,6 +578,7 @@ impl StreamProfileConfig {
     #[must_use]
     pub fn to_stream_config(&self, show_cursor: bool) -> StreamConfig {
         StreamConfig {
+            codec: self.codec,
             fps: self.fps.max(1),
             bitrate_bps: self.bitrate_bps.max(100_000),
             max_width: self.max_width,
@@ -561,6 +689,9 @@ pub struct NvrDeskConfig {
     pub recording: RecordingConfig,
     pub daemon: DaemonConfig,
     pub input_overlay: InputOverlayConfig,
+    pub pos: PosConfig,
+    pub motion: MotionConfig,
+    pub tls: TlsConfig,
     pub rtsp: RtspConfig,
     pub onvif: OnvifConfig,
 }
@@ -574,6 +705,7 @@ impl Default for NvrDeskConfig {
             main_stream: StreamProfileConfig::default(),
             sub_stream: StreamProfileConfig {
                 enabled: true,
+                codec: VideoCodecKind::H264,
                 path: "/stream2".to_string(),
                 max_width: 640,
                 fps: 8,
@@ -585,6 +717,9 @@ impl Default for NvrDeskConfig {
             recording: RecordingConfig::default(),
             daemon: DaemonConfig::default(),
             input_overlay: InputOverlayConfig::default(),
+            pos: PosConfig::default(),
+            motion: MotionConfig::default(),
+            tls: TlsConfig::default(),
             rtsp: RtspConfig::default(),
             onvif: OnvifConfig::default(),
         }

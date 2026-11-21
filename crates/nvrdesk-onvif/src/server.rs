@@ -1,7 +1,8 @@
-//! ONVIF Profile S HTTP/SOAP server (Device, Media, and HTTP JPEG Snapshot endpoint).
+//! ONVIF Profile S & Profile T HTTP/SOAP server (Device, Media, Media2, Events, and JPEG Snapshots).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -15,6 +16,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info};
 
 use crate::{
+    events::EventBroker,
     soap::{self, OnvifDeviceMeta, OnvifMediaProfile},
     ws_security::OnvifAuthConfig,
 };
@@ -31,9 +33,10 @@ struct AppState {
     profiles: Arc<RwLock<Vec<OnvifMediaProfile>>>,
     auth: Option<OnvifAuthConfig>,
     snapshots: Arc<dyn SnapshotProvider>,
+    events: EventBroker,
 }
 
-/// ONVIF Profile S HTTP server (`device_service`, `media_service`, `/snapshot/{profile}`).
+/// ONVIF Profile S/T HTTP server (`device_service`, `media_service`, `media2_service`, `events_service`, `/snapshot/{profile}`).
 pub struct OnvifServer {
     listener: TcpListener,
     app: Router,
@@ -47,16 +50,31 @@ pub fn build_onvif_router(
     auth: Option<OnvifAuthConfig>,
     snapshots: Arc<dyn SnapshotProvider>,
 ) -> Router {
+    build_onvif_router_with_events(meta, profiles, auth, snapshots, EventBroker::new())
+}
+
+/// Builds an Axum `Router` exposing ONVIF Profile S/T SOAP services backed by a shared [`EventBroker`].
+pub fn build_onvif_router_with_events(
+    meta: OnvifDeviceMeta,
+    profiles: Vec<OnvifMediaProfile>,
+    auth: Option<OnvifAuthConfig>,
+    snapshots: Arc<dyn SnapshotProvider>,
+    events: EventBroker,
+) -> Router {
     let state = AppState {
         meta,
         profiles: Arc::new(RwLock::new(profiles)),
         auth,
         snapshots,
+        events,
     };
 
     Router::new()
         .route("/onvif/device_service", post(handle_soap))
         .route("/onvif/media_service", post(handle_soap))
+        .route("/onvif/media2_service", post(handle_soap))
+        .route("/onvif/events_service", post(handle_soap))
+        .route("/onvif/events/sub/{sub_id}", post(handle_subscription_soap))
         .route("/onvif/Media", post(handle_soap))
         .route("/snapshot/{profile}", get(handle_snapshot))
         .with_state(state)
@@ -142,18 +160,40 @@ async fn handle_soap(
     let (src_w, src_h, src_fps) = profiles
         .first()
         .map_or((1920, 1080, 15), |p| (p.width, p.height, p.fps));
+    let http_scheme = if state.meta.https_enabled {
+        "https"
+    } else {
+        "http"
+    };
+    let (rtsp_scheme, rtsp_port) = if let Some(tls_port) = state.meta.rtsps_port {
+        ("rtsps", tls_port)
+    } else {
+        ("rtsp", state.meta.rtsp_port)
+    };
 
     let xml = match req.action.as_str() {
         "GetSystemDateAndTime" => soap::get_system_date_and_time_response(),
         "GetDeviceInformation" => soap::get_device_information_response(&state.meta),
-        "GetCapabilities" => soap::get_capabilities_response(&host, state.meta.http_port),
-        "GetServices" => soap::get_services_response(&host, state.meta.http_port),
-        "GetServiceCapabilities" => soap::get_service_capabilities_response(),
+        "GetCapabilities" => {
+            soap::get_capabilities_response(&host, state.meta.http_port, state.meta.https_enabled)
+        }
+        "GetServices" => {
+            soap::get_services_response(&host, state.meta.http_port, state.meta.https_enabled)
+        }
+        "GetServiceCapabilities" => {
+            soap::get_service_capabilities_response(state.meta.https_enabled)
+        }
         "GetScopes" => soap::get_scopes_response(&state.meta),
         "GetNetworkInterfaces" => soap::get_network_interfaces_response(&host),
         "GetHostname" => soap::get_hostname_response(),
         "GetDNS" => soap::get_dns_response(),
-        "GetProfiles" => soap::get_profiles_response(&profiles),
+        "GetProfiles" => {
+            if req.is_media2 {
+                soap::media2_get_profiles_response(&profiles, &state.meta)
+            } else {
+                soap::get_profiles_response(&profiles)
+            }
+        }
         "GetProfile" => {
             let found = req
                 .profile_token
@@ -175,10 +215,18 @@ async fn handle_soap(
             soap::get_video_source_configurations_response(src_w, src_h)
         }
         "GetVideoEncoderConfigurations" | "GetVideoEncoderConfiguration" => {
-            soap::get_video_encoder_configurations_response(&profiles)
+            if req.is_media2 {
+                soap::media2_get_video_encoder_configurations_response(&profiles)
+            } else {
+                soap::get_video_encoder_configurations_response(&profiles)
+            }
         }
         "GetVideoEncoderConfigurationOptions" => {
-            soap::get_video_encoder_configuration_options_response(&profiles)
+            if req.is_media2 {
+                soap::media2_get_video_encoder_configuration_options_response(&profiles)
+            } else {
+                soap::get_video_encoder_configuration_options_response(&profiles)
+            }
         }
         "SetVideoEncoderConfiguration" => soap::set_video_encoder_configuration_response(),
         "GetStreamUri" => {
@@ -188,8 +236,12 @@ async fn handle_soap(
                 .and_then(|tok| profiles.iter().find(|p| p.token == tok))
                 .or_else(|| profiles.first());
             let rtsp_path = profile.map_or("/stream1", |p| p.rtsp_path.as_str());
-            let uri = format!("rtsp://{host}:{}{rtsp_path}", state.meta.rtsp_port);
-            soap::get_stream_uri_response(&uri)
+            let uri = format!("{rtsp_scheme}://{host}:{rtsp_port}{rtsp_path}");
+            if req.is_media2 {
+                soap::media2_get_stream_uri_response(&uri)
+            } else {
+                soap::get_stream_uri_response(&uri)
+            }
         }
         "GetSnapshotUri" => {
             let profile = req
@@ -198,9 +250,26 @@ async fn handle_soap(
                 .and_then(|tok| profiles.iter().find(|p| p.token == tok))
                 .or_else(|| profiles.first());
             let slug = profile.map_or("main", |p| p.snapshot_slug.as_str());
-            let uri = format!("http://{host}:{}/snapshot/{slug}", state.meta.http_port);
-            soap::get_snapshot_uri_response(&uri)
+            let uri = format!(
+                "{http_scheme}://{host}:{}/snapshot/{slug}",
+                state.meta.http_port
+            );
+            if req.is_media2 {
+                soap::media2_get_snapshot_uri_response(&uri)
+            } else {
+                soap::get_snapshot_uri_response(&uri)
+            }
         }
+        "GetEventProperties" => soap::get_event_properties_response(),
+        "CreatePullPointSubscription" => {
+            let sub_id = state.events.create_subscription();
+            let sub_url = format!(
+                "{http_scheme}://{host}:{}/onvif/events/sub/{sub_id}",
+                state.meta.http_port
+            );
+            soap::create_pull_point_subscription_response(&sub_url)
+        }
+        "SetSynchronizationPoint" => soap::set_synchronization_point_response(),
         other => {
             debug!(action = %other, "unsupported ONVIF SOAP action");
             return soap_response(
@@ -214,6 +283,65 @@ async fn handle_soap(
     };
 
     soap_response(StatusCode::OK, xml)
+}
+
+async fn handle_subscription_soap(
+    State(state): State<AppState>,
+    Path(sub_id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let Some(req) = soap::parse_soap_request(&body) else {
+        return soap_response(
+            StatusCode::BAD_REQUEST,
+            soap::soap_fault("ter:InvalidArgVal", "Malformed SOAP request body"),
+        );
+    };
+
+    if let Some(auth) = &state.auth {
+        let soap_ok = auth.verify_soap_xml(&body);
+        let basic_ok = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|hdr| auth.verify_http_basic(hdr));
+        if !soap_ok && !basic_ok {
+            return soap_response(
+                StatusCode::UNAUTHORIZED,
+                soap::soap_fault("ter:NotAuthorized", "Authentication required"),
+            );
+        }
+    }
+
+    match req.action.as_str() {
+        "PullMessages" => {
+            let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(1).min(15));
+            let limit = req.message_limit.unwrap_or(16).clamp(1, 64);
+            match state.events.pull_messages(&sub_id, timeout, limit).await {
+                Some(events) => {
+                    soap_response(StatusCode::OK, soap::pull_messages_response(&events))
+                }
+                None => soap_response(
+                    StatusCode::BAD_REQUEST,
+                    soap::soap_fault("ter:UnknownSubscription", "Unknown PullPoint subscription"),
+                ),
+            }
+        }
+        "Renew" => soap_response(StatusCode::OK, soap::renew_subscription_response()),
+        "Unsubscribe" => {
+            state.events.unsubscribe(&sub_id);
+            soap_response(StatusCode::OK, soap::unsubscribe_response())
+        }
+        "SetSynchronizationPoint" => {
+            soap_response(StatusCode::OK, soap::set_synchronization_point_response())
+        }
+        other => soap_response(
+            StatusCode::BAD_REQUEST,
+            soap::soap_fault(
+                "ter:ActionNotSupported",
+                &format!("Unsupported subscription action: {other}"),
+            ),
+        ),
+    }
 }
 
 async fn handle_snapshot(

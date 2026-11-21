@@ -11,7 +11,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub use audio::{AudioCaptureSource, list_microphones};
+pub use audio::{AudioCaptureSource, AudioOutputSink, list_microphones};
 use nvrdesk_core::{
     DeviceEntry, DeviceInventory, MonitorBounds, NvrDeskError, PixelFormat, RawVideoFrame,
 };

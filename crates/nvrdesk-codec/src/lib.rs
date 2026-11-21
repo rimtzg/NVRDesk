@@ -6,6 +6,7 @@ pub mod ffmpeg;
 use bytes::Bytes;
 use nvrdesk_core::{
     EncodedFrame, EncoderBackendKind, EncoderConfig, I420Frame, NvrDeskError, StreamConfig,
+    VideoCodecKind,
 };
 use openh264::{
     OpenH264API,
@@ -15,9 +16,9 @@ use openh264::{
     },
     formats::YUVSource,
 };
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::ffmpeg::{FfmpegCliEncoder, probe_hw_h264_codec};
+use crate::ffmpeg::{FfmpegCliEncoder, probe_any_h265_codec, probe_hw_h264_codec};
 
 /// Abstraction over a video encoder producing Annex-B stripped H.264/H.265 access units.
 pub trait VideoEncoder: Send {
@@ -33,13 +34,38 @@ pub trait VideoEncoder: Send {
 
     /// Returns the most recently observed SPS and PPS NAL units, if available.
     fn parameter_sets(&self) -> (Option<Bytes>, Option<Bytes>);
+
+    /// Returns the most recently observed H.265 VPS NAL unit, if available.
+    fn vps(&self) -> Option<Bytes> {
+        None
+    }
 }
 
-/// Creates a video encoder matching `enc_cfg` with automatic fallback to `OpenH264Encoder`.
+/// Creates a video encoder matching `stream_cfg.codec` and `enc_cfg` with automatic fallback to `OpenH264Encoder`.
 pub fn create_video_encoder(
     stream_cfg: &StreamConfig,
     enc_cfg: &EncoderConfig,
 ) -> Result<Box<dyn VideoEncoder>, NvrDeskError> {
+    if stream_cfg.codec == VideoCodecKind::H265 {
+        if let Some(codec) = enc_cfg
+            .ffmpeg_codec
+            .as_deref()
+            .filter(|c| c.contains("hevc") || c.contains("265"))
+            .or_else(|| probe_any_h265_codec(&enc_cfg.ffmpeg_path))
+        {
+            info!(codec = %codec, "initializing FFmpeg H.265/HEVC encoder");
+            return Ok(Box::new(FfmpegCliEncoder::new(
+                enc_cfg.ffmpeg_path.clone(),
+                codec.to_string(),
+                stream_cfg,
+            )));
+        }
+        warn!(
+            "H.265 requested but no FFmpeg HEVC encoder available; falling back to OpenH264 (H.264)"
+        );
+        return Ok(Box::new(OpenH264Encoder::new(stream_cfg)?));
+    }
+
     match enc_cfg.backend {
         EncoderBackendKind::Openh264 => Ok(Box::new(OpenH264Encoder::new(stream_cfg)?)),
         EncoderBackendKind::Ffmpeg => {
@@ -185,7 +211,9 @@ impl VideoEncoder for OpenH264Encoder {
         let pts_90khz = frame.timestamp_us.saturating_mul(90) / 1_000;
 
         Ok(EncodedFrame {
+            codec: VideoCodecKind::H264,
             nals,
+            vps: None,
             sps: self.cached_sps.clone(),
             pps: self.cached_pps.clone(),
             is_keyframe,
@@ -245,6 +273,7 @@ mod tests {
     #[test]
     fn encodes_i420_frame_with_sps_pps_and_idr() {
         let cfg = StreamConfig {
+            codec: VideoCodecKind::H264,
             fps: 15,
             bitrate_bps: 800_000,
             max_width: 640,

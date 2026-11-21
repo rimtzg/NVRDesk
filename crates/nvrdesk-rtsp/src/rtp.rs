@@ -1,12 +1,15 @@
-//! RFC 6184 H.264 RTP packetizer.
+//! RFC 6184 H.264 & RFC 7798 H.265 RTP packetizer.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use nvrdesk_core::EncodedFrame;
+use nvrdesk_core::{EncodedFrame, VideoCodecKind};
 
 const RTP_HEADER_LEN: usize = 12;
 const DEFAULT_MTU: usize = 1400;
 
-/// Packetizes H.264 Annex-B-stripped NAL units into RFC 6184 RTP packets.
+/// Type alias highlighting H.264 + H.265 support.
+pub type VideoRtpPacketizer = H264RtpPacketizer;
+
+/// Packetizes H.264 (RFC 6184) and H.265 (RFC 7798) Annex-B-stripped NAL units into RTP packets.
 pub struct H264RtpPacketizer {
     payload_type: u8,
     sequence_number: u16,
@@ -34,22 +37,49 @@ impl H264RtpPacketizer {
 
     /// Packetizes all NAL units of an `EncodedFrame` into one or more RTP packets.
     pub fn packetize_frame(&mut self, frame: &EncodedFrame) -> Vec<Bytes> {
-        let mut ordered_nals: Vec<&[u8]> = Vec::with_capacity(frame.nals.len() + 2);
+        let mut ordered_nals: Vec<&[u8]> = Vec::with_capacity(frame.nals.len() + 3);
 
         if frame.is_keyframe {
-            let has_sps = frame
-                .nals
-                .iter()
-                .any(|n| !n.is_empty() && (n[0] & 0x1F) == 7);
-            let has_pps = frame
-                .nals
-                .iter()
-                .any(|n| !n.is_empty() && (n[0] & 0x1F) == 8);
-            if !has_sps && let Some(sps) = &frame.sps {
-                ordered_nals.push(sps.as_ref());
-            }
-            if !has_pps && let Some(pps) = &frame.pps {
-                ordered_nals.push(pps.as_ref());
+            match frame.codec {
+                VideoCodecKind::H264 => {
+                    let has_sps = frame
+                        .nals
+                        .iter()
+                        .any(|n| !n.is_empty() && (n[0] & 0x1F) == 7);
+                    let has_pps = frame
+                        .nals
+                        .iter()
+                        .any(|n| !n.is_empty() && (n[0] & 0x1F) == 8);
+                    if !has_sps && let Some(sps) = &frame.sps {
+                        ordered_nals.push(sps.as_ref());
+                    }
+                    if !has_pps && let Some(pps) = &frame.pps {
+                        ordered_nals.push(pps.as_ref());
+                    }
+                }
+                VideoCodecKind::H265 => {
+                    let has_vps = frame
+                        .nals
+                        .iter()
+                        .any(|n| n.len() >= 2 && ((n[0] >> 1) & 0x3F) == 32);
+                    let has_sps = frame
+                        .nals
+                        .iter()
+                        .any(|n| n.len() >= 2 && ((n[0] >> 1) & 0x3F) == 33);
+                    let has_pps = frame
+                        .nals
+                        .iter()
+                        .any(|n| n.len() >= 2 && ((n[0] >> 1) & 0x3F) == 34);
+                    if !has_vps && let Some(vps) = &frame.vps {
+                        ordered_nals.push(vps.as_ref());
+                    }
+                    if !has_sps && let Some(sps) = &frame.sps {
+                        ordered_nals.push(sps.as_ref());
+                    }
+                    if !has_pps && let Some(pps) = &frame.pps {
+                        ordered_nals.push(pps.as_ref());
+                    }
+                }
             }
         }
 
@@ -69,7 +99,14 @@ impl H264RtpPacketizer {
             if nal.len() <= max_payload {
                 packets.push(self.build_single_nal_packet(nal, ts, is_last_nal));
             } else {
-                self.push_fua_packets(nal, ts, is_last_nal, max_payload, &mut packets);
+                match frame.codec {
+                    VideoCodecKind::H264 => {
+                        self.push_fua_packets(nal, ts, is_last_nal, max_payload, &mut packets);
+                    }
+                    VideoCodecKind::H265 => {
+                        self.push_hevc_fu_packets(nal, ts, is_last_nal, max_payload, &mut packets);
+                    }
+                }
             }
         }
 
@@ -119,6 +156,46 @@ impl H264RtpPacketizer {
         }
     }
 
+    fn push_hevc_fu_packets(
+        &mut self,
+        nal: &[u8],
+        ts: u32,
+        is_last_nal: bool,
+        max_payload: usize,
+        out: &mut Vec<Bytes>,
+    ) {
+        if nal.len() < 2 {
+            return;
+        }
+        let nal_type = (nal[0] >> 1) & 0x3F;
+        let fu_hdr0 = (nal[0] & 0x81) | (49 << 1); // RFC 7798 FU type = 49
+        let fu_hdr1 = nal[1];
+        let payload = &nal[2..];
+        let max_frag = max_payload.saturating_sub(3).max(1);
+
+        let total_frags = payload.len().div_ceil(max_frag);
+        for (frag_idx, chunk) in payload.chunks(max_frag).enumerate() {
+            let is_start = frag_idx == 0;
+            let is_end = frag_idx + 1 == total_frags;
+            let mut fu_header = nal_type;
+            if is_start {
+                fu_header |= 0x80;
+            }
+            if is_end {
+                fu_header |= 0x40;
+            }
+            let marker = is_last_nal && is_end;
+
+            let mut pkt = BytesMut::with_capacity(RTP_HEADER_LEN + 3 + chunk.len());
+            self.write_rtp_header(&mut pkt, ts, marker);
+            pkt.put_u8(fu_hdr0);
+            pkt.put_u8(fu_hdr1);
+            pkt.put_u8(fu_header);
+            pkt.extend_from_slice(chunk);
+            out.push(pkt.freeze());
+        }
+    }
+
     fn write_rtp_header(&mut self, buf: &mut BytesMut, ts: u32, marker: bool) {
         let seq = self.sequence_number;
         self.sequence_number = self.sequence_number.wrapping_add(1);
@@ -144,7 +221,9 @@ mod tests {
     fn packetizes_small_nal_as_single_rtp_packet() {
         let mut p = H264RtpPacketizer::new(0x1234_5678);
         let frame = EncodedFrame {
+            codec: VideoCodecKind::H264,
             nals: vec![Bytes::from_static(&[0x65, 0x01, 0x02, 0x03])],
+            vps: None,
             sps: Some(Bytes::from_static(&[0x67, 0x42, 0x00, 0x1E])),
             pps: Some(Bytes::from_static(&[0x68, 0xCE, 0x3C, 0x80])),
             is_keyframe: true,
@@ -167,7 +246,9 @@ mod tests {
         let mut big = vec![0x65];
         big.extend(std::iter::repeat_n(0xAB, 3500));
         let frame = EncodedFrame {
+            codec: VideoCodecKind::H264,
             nals: vec![Bytes::from(big)],
+            vps: None,
             sps: None,
             pps: None,
             is_keyframe: false,
@@ -183,6 +264,36 @@ mod tests {
         // Last fragment has FU-A E bit and RTP marker bit.
         let last = pkts.last().expect("non-empty");
         assert_eq!(last[13] & 0x40, 0x40);
+        assert_eq!(last[1] & 0x80, 0x80);
+    }
+
+    #[test]
+    fn fragments_large_h265_nal_with_rfc7798_fu() {
+        let mut p = VideoRtpPacketizer::new(0xDEAD_BEEF);
+        // H.265 IDR_W_RADL (NAL type 19 -> b0 = 19 << 1 = 0x26, b1 = 0x01)
+        let mut big = vec![0x26, 0x01];
+        big.extend(std::iter::repeat_n(0xCD, 3500));
+        let frame = EncodedFrame {
+            codec: VideoCodecKind::H265,
+            nals: vec![Bytes::from(big)],
+            vps: Some(Bytes::from_static(&[0x40, 0x01, 0x0C])),
+            sps: Some(Bytes::from_static(&[0x42, 0x01, 0x01])),
+            pps: Some(Bytes::from_static(&[0x44, 0x01, 0xC1])),
+            is_keyframe: true,
+            pts_90khz: 27000,
+        };
+        let pkts = p.packetize_frame(&frame);
+        // 3 parameter sets + >= 3 FU fragments
+        assert!(pkts.len() >= 6);
+        assert_eq!((pkts[0][12] >> 1) & 0x3F, 32); // VPS
+        assert_eq!((pkts[1][12] >> 1) & 0x3F, 33); // SPS
+        assert_eq!((pkts[2][12] >> 1) & 0x3F, 34); // PPS
+        // FU Header type = 49, S bit set, FuType = 19
+        assert_eq!((pkts[3][12] >> 1) & 0x3F, 49);
+        assert_eq!(pkts[3][14] & 0x80, 0x80);
+        assert_eq!(pkts[3][14] & 0x3F, 19);
+        let last = pkts.last().expect("non-empty");
+        assert_eq!(last[14] & 0x40, 0x40);
         assert_eq!(last[1] & 0x80, 0x80);
     }
 }

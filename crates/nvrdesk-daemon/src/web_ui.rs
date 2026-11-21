@@ -7,27 +7,30 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{
+        Path, State,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use bytes::Bytes;
 use futures_core::Stream;
 use nvrdesk_capture::enumerate_devices;
-use nvrdesk_core::{NvrDeskConfig, WebcamMode};
-use nvrdesk_onvif::SnapshotProvider;
+use nvrdesk_core::{NvrDeskConfig, PosOsdLevel, PosOsdLine, WebcamMode};
+use nvrdesk_onvif::{EventBroker, OnvifEventRecord, SnapshotProvider};
 use nvrdesk_rtsp::normalize_stream_path;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::recorder::RecordingStats;
+use crate::{pos_osd::PosOsdStore, recorder::RecordingStats};
 
 #[derive(RustEmbed)]
 #[folder = "../../web-ui"]
@@ -49,8 +52,13 @@ pub struct DaemonStatus {
     pub sub_frames: u64,
     pub active_encoder: String,
     pub onvif_enabled: bool,
+    pub https_enabled: bool,
+    pub rtsps_port: Option<u16>,
+    pub backchannel_packets: u64,
     pub recording: RecordingStats,
     pub endpoints: Vec<EndpointInfo>,
+    pub active_osd_lines: Vec<PosOsdLine>,
+    pub recent_events: Vec<OnvifEventRecord>,
 }
 
 /// Shared runtime state backing the Web UI, REST API, and worker coordination.
@@ -67,26 +75,40 @@ pub struct DaemonSharedState {
     pub active_players_fn: Arc<dyn Fn() -> usize + Send + Sync>,
     pub display_ip: String,
     pub rtsp_port: u16,
+    pub rtsps_port: Option<u16>,
     pub http_port: u16,
+    pub https_enabled: bool,
+    pub backchannel_packets: Arc<AtomicU64>,
     pub snapshots: Arc<dyn SnapshotProvider>,
+    pub pos_osd: Arc<PosOsdStore>,
+    pub events: EventBroker,
 }
 
-/// Builds the current list of advertised RTSP/ONVIF/Web UI endpoints from live configuration.
+/// Builds the current list of advertised RTSP/RTSPS/ONVIF/Web UI endpoints from live configuration.
 #[must_use]
 pub fn build_endpoints(
     cfg: &NvrDeskConfig,
     display_ip: &str,
     rtsp_port: u16,
+    rtsps_port: Option<u16>,
     http_port: u16,
+    https_enabled: bool,
 ) -> Vec<EndpointInfo> {
     let main_path = normalize_stream_path(&cfg.main_stream.path);
     let sub_path = normalize_stream_path(&cfg.sub_stream.path);
     let webcam_path = normalize_stream_path(&cfg.webcam.channel_path);
+    let http_scheme = if https_enabled { "https" } else { "http" };
 
     let mut endpoints = vec![EndpointInfo {
         label: "MainStream RTSP".into(),
         url: format!("rtsp://{display_ip}:{rtsp_port}{main_path}"),
     }];
+    if let Some(tls_port) = rtsps_port {
+        endpoints.push(EndpointInfo {
+            label: "MainStream RTSPS (TLS)".into(),
+            url: format!("rtsps://{display_ip}:{tls_port}{main_path}"),
+        });
+    }
     if cfg.sub_stream.enabled {
         endpoints.push(EndpointInfo {
             label: "SubStream RTSP".into(),
@@ -102,23 +124,31 @@ pub fn build_endpoints(
     if cfg.onvif.enabled {
         endpoints.push(EndpointInfo {
             label: "ONVIF Device Service".into(),
-            url: format!("http://{display_ip}:{http_port}/onvif/device_service"),
+            url: format!("{http_scheme}://{display_ip}:{http_port}/onvif/device_service"),
+        });
+        endpoints.push(EndpointInfo {
+            label: "ONVIF Media2 (Profile T)".into(),
+            url: format!("{http_scheme}://{display_ip}:{http_port}/onvif/media2_service"),
+        });
+        endpoints.push(EndpointInfo {
+            label: "ONVIF Events (PullPoint)".into(),
+            url: format!("{http_scheme}://{display_ip}:{http_port}/onvif/events_service"),
         });
         endpoints.push(EndpointInfo {
             label: "Snapshot Main".into(),
-            url: format!("http://{display_ip}:{http_port}/snapshot/main"),
+            url: format!("{http_scheme}://{display_ip}:{http_port}/snapshot/main"),
         });
     }
     if cfg.daemon.web_ui_enabled {
         endpoints.push(EndpointInfo {
             label: "Web Control Panel".into(),
-            url: format!("http://{display_ip}:{http_port}/"),
+            url: format!("{http_scheme}://{display_ip}:{http_port}/"),
         });
     }
     endpoints
 }
 
-/// Builds the Axum router for the embedded Web UI, REST API, and MJPEG preview.
+/// Builds the Axum router for the embedded Web UI, REST/WebSocket POS OSD API, and MJPEG preview.
 pub fn build_web_ui_router(state: DaemonSharedState) -> Router {
     Router::new()
         .route("/", get(serve_index))
@@ -128,6 +158,13 @@ pub fn build_web_ui_router(state: DaemonSharedState) -> Router {
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/control/pause", post(post_pause))
         .route("/api/v1/control/resume", post(post_resume))
+        .route(
+            "/api/v1/osd/text",
+            get(get_osd_text).post(post_osd_text).delete(delete_all_osd),
+        )
+        .route("/api/v1/osd/text/{slot}", delete(delete_slot_osd))
+        .route("/api/v1/ws/osd", get(ws_osd_handler))
+        .route("/api/v1/events", get(get_events))
         .route("/preview/{profile}", get(serve_mjpeg_preview))
         .with_state(state)
 }
@@ -170,10 +207,121 @@ async fn get_status(State(state): State<DaemonSharedState>) -> Json<DaemonStatus
         sub_frames: state.sub_frames.load(Ordering::Relaxed),
         active_encoder: state.active_encoder.read().expect("encoder lock").clone(),
         onvif_enabled: cfg.onvif.enabled,
+        https_enabled: state.https_enabled,
+        rtsps_port: state.rtsps_port,
+        backchannel_packets: state.backchannel_packets.load(Ordering::Relaxed),
         recording: state.recording_stats.read().expect("rec lock").clone(),
-        endpoints: build_endpoints(&cfg, &state.display_ip, state.rtsp_port, state.http_port),
+        endpoints: build_endpoints(
+            &cfg,
+            &state.display_ip,
+            state.rtsp_port,
+            state.rtsps_port,
+            state.http_port,
+            state.https_enabled,
+        ),
+        active_osd_lines: state.pos_osd.active_lines(Instant::now()),
+        recent_events: state.events.recent(10),
     };
     Json(status)
+}
+
+#[derive(Debug, Deserialize)]
+struct PosOsdRequest {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    slot: Option<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    level: PosOsdLevel,
+    #[serde(default)]
+    emit_event: bool,
+}
+
+fn apply_pos_osd_command(state: &DaemonSharedState, payload: PosOsdRequest) {
+    if payload.action.as_deref() == Some("clear") {
+        if let Some(slot) = payload.slot.as_deref() {
+            state.pos_osd.clear_slot(slot);
+        } else {
+            state.pos_osd.clear_all();
+        }
+        return;
+    }
+
+    let slot = payload.slot.unwrap_or_else(|| "ticket".to_string());
+    let default_ttl = state.config.read().expect("config lock").pos.default_ttl_ms;
+    let ttl_ms = payload.ttl_ms.unwrap_or(default_ttl);
+    let level_label = match payload.level {
+        PosOsdLevel::Info => "info",
+        PosOsdLevel::Warning => "warning",
+        PosOsdLevel::Alert => "alert",
+    };
+
+    if payload.emit_event && !payload.text.trim().is_empty() {
+        state
+            .events
+            .publish_pos_event(&slot, payload.text.trim(), level_label);
+    }
+    state
+        .pos_osd
+        .set_line(slot, payload.text, payload.level, ttl_ms);
+}
+
+async fn get_osd_text(State(state): State<DaemonSharedState>) -> Json<Vec<PosOsdLine>> {
+    Json(state.pos_osd.active_lines(Instant::now()))
+}
+
+async fn post_osd_text(
+    State(state): State<DaemonSharedState>,
+    Json(payload): Json<PosOsdRequest>,
+) -> Json<Vec<PosOsdLine>> {
+    apply_pos_osd_command(&state, payload);
+    Json(state.pos_osd.active_lines(Instant::now()))
+}
+
+async fn delete_all_osd(State(state): State<DaemonSharedState>) -> StatusCode {
+    state.pos_osd.clear_all();
+    StatusCode::NO_CONTENT
+}
+
+async fn delete_slot_osd(
+    State(state): State<DaemonSharedState>,
+    Path(slot): Path<String>,
+) -> StatusCode {
+    state.pos_osd.clear_slot(&slot);
+    StatusCode::NO_CONTENT
+}
+
+async fn ws_osd_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<DaemonSharedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_osd(socket, state))
+}
+
+async fn handle_ws_osd(mut socket: WebSocket, state: DaemonSharedState) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            WsMessage::Text(txt) => {
+                if let Ok(req) = serde_json::from_str::<PosOsdRequest>(&txt) {
+                    apply_pos_osd_command(&state, req);
+                    let active = state.pos_osd.active_lines(Instant::now());
+                    if let Ok(reply) = serde_json::to_string(&active) {
+                        let _ = socket.send(WsMessage::Text(reply.into())).await;
+                    }
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
+async fn get_events(State(state): State<DaemonSharedState>) -> Json<Vec<OnvifEventRecord>> {
+    Json(state.events.recent(25))
 }
 
 async fn get_devices() -> Response {

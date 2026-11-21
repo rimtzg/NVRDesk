@@ -227,7 +227,9 @@ mod tests {
         };
         let mut rec = RingRecorder::new(cfg).expect("init recorder");
         let idr = EncodedFrame {
+            codec: nvrdesk_core::VideoCodecKind::H264,
             nals: vec![Bytes::from_static(&[0x65, 0x88, 0x84])],
+            vps: None,
             sps: Some(Bytes::from_static(&[0x67, 0x42, 0x00, 0x1E])),
             pps: Some(Bytes::from_static(&[0x68, 0xCE, 0x3C, 0x80])),
             is_keyframe: true,

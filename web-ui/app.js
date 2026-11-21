@@ -51,6 +51,7 @@ async function loadInitial() {
   populateMicSelect(document.getElementById("cfg-audio-device"), devices.microphones, cfg.audio.device_name);
 
   document.getElementById("cfg-encoder-backend").value = cfg.encoder.backend;
+  document.getElementById("cfg-main-codec").value = cfg.main_stream.codec || "h264";
   document.getElementById("cfg-main-fps").value = cfg.main_stream.fps;
   document.getElementById("cfg-main-bitrate").value = cfg.main_stream.bitrate_bps;
   document.getElementById("cfg-keystroke-mode").value = cfg.input_overlay.keystroke_mode;
@@ -63,9 +64,17 @@ async function loadInitial() {
 
   document.getElementById("cfg-audio-enabled").checked = cfg.audio.enabled;
   document.getElementById("cfg-audio-codec").value = cfg.audio.codec;
+  document.getElementById("cfg-backchannel-enabled").checked = Boolean(cfg.audio.backchannel_enabled);
 
   document.getElementById("cfg-rec-enabled").checked = cfg.recording.enabled;
   document.getElementById("cfg-rec-max-mb").value = cfg.recording.max_total_mb;
+
+  document.getElementById("cfg-motion-enabled").checked = cfg.motion ? cfg.motion.enabled : true;
+  document.getElementById("cfg-https-enabled").checked = cfg.tls ? cfg.tls.https_enabled : false;
+  document.getElementById("cfg-rtsps-enabled").checked = cfg.tls ? cfg.tls.rtsps_enabled : false;
+  document.getElementById("cfg-privacy-masks").value = JSON.stringify(
+    (cfg.pos && cfg.pos.privacy_masks) ? cfg.pos.privacy_masks : []
+  );
 }
 
 async function refreshStatus() {
@@ -88,7 +97,12 @@ async function refreshStatus() {
     document.getElementById("stat-main-frames").textContent = String(st.main_frames);
     document.getElementById("stat-sub-frames").textContent = String(st.sub_frames);
     document.getElementById("stat-encoder").textContent = st.active_encoder || "idle";
-    document.getElementById("stat-onvif").textContent = st.onvif_enabled ? "Enabled" : "Disabled";
+    const secMode = [
+      st.onvif_enabled ? "ONVIF" : null,
+      st.https_enabled ? "HTTPS" : null,
+      st.rtsps_port ? "RTSPS" : null,
+    ].filter(Boolean).join(" / ") || "Disabled";
+    document.getElementById("stat-onvif").textContent = secMode;
 
     if (st.recording && st.recording.enabled) {
       const mb = (st.recording.total_bytes / (1024 * 1024)).toFixed(1);
@@ -101,6 +115,14 @@ async function refreshStatus() {
     endpoints.innerHTML = st.endpoints
       .map((ep) => `<div class="endpoint-row"><span>${ep.label}</span><code>${ep.url}</code></div>`)
       .join("");
+
+    const feed = document.getElementById("events-feed");
+    const events = st.recent_events || [];
+    feed.innerHTML = events.length === 0
+      ? "<div class=\"event-row\"><span>No events yet</span><span>-</span></div>"
+      : events.slice(0, 6).map((ev) => (
+        `<div class="event-row"><span>${ev.topic}: ${ev.data_value}</span><span>${ev.utc_time}</span></div>`
+      )).join("");
   } catch (err) {
     document.getElementById("status-badge").textContent = "Offline";
   }
@@ -121,6 +143,7 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   const updated = structuredClone(currentConfig);
   updated.source.display = Number(document.getElementById("cfg-display").value) || 0;
   updated.encoder.backend = document.getElementById("cfg-encoder-backend").value;
+  updated.main_stream.codec = document.getElementById("cfg-main-codec").value;
   updated.main_stream.fps = Math.max(1, Number(document.getElementById("cfg-main-fps").value) || 15);
   updated.main_stream.bitrate_bps = Math.max(100000, Number(document.getElementById("cfg-main-bitrate").value) || 2000000);
   updated.input_overlay.keystroke_mode = document.getElementById("cfg-keystroke-mode").value;
@@ -136,9 +159,26 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   const micVal = document.getElementById("cfg-audio-device").value;
   updated.audio.device_name = micVal ? micVal : null;
   updated.audio.codec = document.getElementById("cfg-audio-codec").value;
+  updated.audio.backchannel_enabled = document.getElementById("cfg-backchannel-enabled").checked;
 
   updated.recording.enabled = document.getElementById("cfg-rec-enabled").checked;
   updated.recording.max_total_mb = Math.max(64, Number(document.getElementById("cfg-rec-max-mb").value) || 1024);
+
+  updated.motion = updated.motion || {};
+  updated.motion.enabled = document.getElementById("cfg-motion-enabled").checked;
+  updated.tls = updated.tls || {};
+  updated.tls.https_enabled = document.getElementById("cfg-https-enabled").checked;
+  updated.tls.rtsps_enabled = document.getElementById("cfg-rtsps-enabled").checked;
+  updated.pos = updated.pos || {};
+  try {
+    const parsedMasks = JSON.parse(document.getElementById("cfg-privacy-masks").value || "[]");
+    if (Array.isArray(parsedMasks)) {
+      updated.pos.privacy_masks = parsedMasks;
+    }
+  } catch (maskErr) {
+    document.getElementById("save-msg").textContent = `Invalid Privacy Masks JSON: ${maskErr.message}`;
+    return;
+  }
 
   const msg = document.getElementById("save-msg");
   try {
@@ -156,3 +196,27 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
 
 loadInitial().then(refreshStatus);
 setInterval(refreshStatus, 2000);
+
+document.getElementById("send-osd-btn").addEventListener("click", async () => {
+  const input = document.getElementById("osd-text-input");
+  const level = document.getElementById("osd-level-select").value;
+  const text = input.value.trim();
+  if (!text) return;
+  await fetch("/api/v1/osd/text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      slot: "ticket",
+      text,
+      level,
+      emit_event: level !== "info",
+    }),
+  });
+  await refreshStatus();
+});
+
+document.getElementById("clear-osd-btn").addEventListener("click", async () => {
+  await fetch("/api/v1/osd/text", { method: "DELETE" });
+  document.getElementById("osd-text-input").value = "";
+  await refreshStatus();
+});

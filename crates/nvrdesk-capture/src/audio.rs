@@ -1,7 +1,8 @@
 //! Cross-platform microphone audio capture and resampling to 8 kHz mono PCM via `cpal`.
 
+use std::collections::VecDeque;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, RecvTimeoutError, SyncSender},
 };
@@ -316,6 +317,213 @@ impl MonoResampler {
             self.prev = cur;
         }
     }
+}
+
+/// Audio playback sink for ONVIF Profile T Backchannel (VMS -> POS speakers).
+pub struct AudioOutputSink {
+    queue: Arc<Mutex<VecDeque<i16>>>,
+    dst_rate: Arc<Mutex<u32>>,
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AudioOutputSink {
+    /// Creates an audio backchannel output sink targeting the default speaker device.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::with_capacity(16_384))),
+            dst_rate: Arc::new(Mutex::new(8_000)),
+            running: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
+    /// Starts audio playback on the default output device.
+    pub fn start(&mut self) -> Result<(), NvrDeskError> {
+        if self.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (init_tx, init_rx) = mpsc::sync_channel(1);
+        let running = Arc::clone(&self.running);
+        running.store(true, Ordering::Release);
+        let queue = Arc::clone(&self.queue);
+        let dst_rate = Arc::clone(&self.dst_rate);
+
+        let worker = thread::Builder::new()
+            .name("nvrdesk-audio-backchannel".into())
+            .spawn(move || {
+                run_audio_output_thread(queue, dst_rate, init_tx, &running);
+            })
+            .map_err(|e| {
+                NvrDeskError::Capture(format!("failed to spawn audio output thread: {e}"))
+            })?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => {
+                self.worker = Some(worker);
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.running.store(false, Ordering::Release);
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                self.running.store(false, Ordering::Release);
+                let _ = worker.join();
+                Err(NvrDeskError::Capture(
+                    "audio output worker terminated during initialization".into(),
+                ))
+            }
+        }
+    }
+
+    /// Pushes mono 8 kHz `i16` PCM samples received from the VMS backchannel.
+    pub fn push_samples_8khz(&self, samples: &[i16]) {
+        if samples.is_empty() {
+            return;
+        }
+        let target_rate = *self.dst_rate.lock().expect("dst_rate lock");
+        let ratio = (target_rate as f64 / f64::from(TARGET_SAMPLE_RATE)).max(1.0);
+        let mut q = self.queue.lock().expect("audio output queue lock");
+        for &s in samples {
+            let repeats = ratio.round() as usize;
+            for _ in 0..repeats.max(1) {
+                if q.len() >= 48_000 {
+                    q.pop_front();
+                }
+                q.push_back(s);
+            }
+        }
+    }
+
+    /// Stops audio playback cleanly.
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.queue.lock().expect("audio output queue lock").clear();
+    }
+}
+
+impl Default for AudioOutputSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AudioOutputSink {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_audio_output_thread(
+    queue: Arc<Mutex<VecDeque<i16>>>,
+    dst_rate: Arc<Mutex<u32>>,
+    init_tx: SyncSender<Result<(), NvrDeskError>>,
+    running: &AtomicBool,
+) {
+    let host = cpal::default_host();
+    let Some(device) = host.default_output_device() else {
+        let _ = init_tx.send(Err(NvrDeskError::Capture(
+            "no audio output device available".into(),
+        )));
+        return;
+    };
+    let supported = match device.default_output_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            let _ = init_tx.send(Err(NvrDeskError::Capture(format!(
+                "failed to query audio output config: {err}"
+            ))));
+            return;
+        }
+    };
+    let sample_rate = supported.sample_rate();
+    let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
+    *dst_rate.lock().expect("dst_rate lock") = sample_rate;
+    let config = supported.into();
+
+    let err_cb = |err| warn!(error = %err, "cpal output stream error");
+    let q_cb = Arc::clone(&queue);
+    let stream_res = match sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            config,
+            move |data: &mut [f32], _| {
+                let mut q = q_cb.lock().expect("audio out lock");
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let v = f32::from(q.pop_front().unwrap_or(0)) / 32768.0;
+                    frame.fill(v);
+                }
+            },
+            err_cb,
+            None,
+        ),
+        SampleFormat::I16 => device.build_output_stream(
+            config,
+            move |data: &mut [i16], _| {
+                let mut q = q_cb.lock().expect("audio out lock");
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let v = q.pop_front().unwrap_or(0);
+                    frame.fill(v);
+                }
+            },
+            err_cb,
+            None,
+        ),
+        SampleFormat::U16 => device.build_output_stream(
+            config,
+            move |data: &mut [u16], _| {
+                let mut q = q_cb.lock().expect("audio out lock");
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let s = q.pop_front().unwrap_or(0);
+                    let v = (i32::from(s) + 32768).clamp(0, 65535) as u16;
+                    frame.fill(v);
+                }
+            },
+            err_cb,
+            None,
+        ),
+        other => {
+            let _ = init_tx.send(Err(NvrDeskError::Capture(format!(
+                "unsupported audio output format: {other:?}"
+            ))));
+            return;
+        }
+    };
+
+    let stream = match stream_res {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = init_tx.send(Err(NvrDeskError::Capture(format!(
+                "failed to open audio output stream: {err}"
+            ))));
+            return;
+        }
+    };
+
+    if let Err(err) = stream.play() {
+        let _ = init_tx.send(Err(NvrDeskError::Capture(format!(
+            "failed to start audio output stream: {err}"
+        ))));
+        return;
+    }
+
+    debug!(
+        sample_rate,
+        channels,
+        ?sample_format,
+        "audio backchannel output started"
+    );
+    let _ = init_tx.send(Ok(()));
+    while running.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(stream);
 }
 
 #[cfg(test)]

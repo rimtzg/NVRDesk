@@ -34,3 +34,18 @@ nvrdesk-onvif = { path = "../nvrdesk-onvif" }
 nvrdesk-pipeline = { path = "../nvrdesk-pipeline" }
 nvrdesk-rtsp = { path = "../nvrdesk-rtsp" }
 sha1.workspace = true
+tokio-rustls.workspace = true
+
+[package.metadata.deb]
+maintainer = "rimtzg <https://github.com/rimtzg/NVRDesk>"
+copyright = "2026, NVRDesk Contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """
+NVRDesk is a cross-platform, MIT-licensed ONVIF/RTSP virtual IP camera
+for POS terminals and desktop monitoring."""
+section = "video"
+priority = "optional"
+assets = [
+    ["target/release/nvrdesk", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/nvrdesk/README.md", "644"],
+]

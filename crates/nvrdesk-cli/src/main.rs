@@ -11,7 +11,8 @@ use std::sync::{
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use nvrdesk_core::{
-    AudioCodecKind, CaptureSourceKind, EncoderBackendKind, KeystrokeMode, NvrDeskConfig, WebcamMode,
+    AudioCodecKind, CaptureSourceKind, EncoderBackendKind, KeystrokeMode, NvrDeskConfig,
+    VideoCodecKind, WebcamMode,
 };
 use nvrdesk_daemon::start_daemon;
 use tracing::info;
@@ -48,6 +49,12 @@ enum CliWebcamMode {
 enum CliAudioCodec {
     Pcmu,
     Pcma,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliVideoCodec {
+    H264,
+    H265,
 }
 
 #[derive(Debug, Parser)]
@@ -160,6 +167,30 @@ struct Cli {
     /// Audio codec (`pcmu` or `pcma`).
     #[arg(long, value_enum)]
     audio_codec: Option<CliAudioCodec>,
+
+    /// Enable audio backchannel (VMS -> POS speakers on `trackID=2`).
+    #[arg(long, default_value_t = false)]
+    backchannel: bool,
+
+    /// Video codec for MainStream (`h264` or `h265`).
+    #[arg(long, value_enum)]
+    codec: Option<CliVideoCodec>,
+
+    /// Enable HTTPS TLS on the HTTP/Web UI/ONVIF port.
+    #[arg(long, default_value_t = false)]
+    https: bool,
+
+    /// Enable RTSPS (TLS-encrypted RTSP) listener.
+    #[arg(long, default_value_t = false)]
+    rtsps: bool,
+
+    /// RTSPS TLS listening port.
+    #[arg(long)]
+    rtsps_port: Option<u16>,
+
+    /// Disable motion detection ONVIF events.
+    #[arg(long, default_value_t = false)]
+    no_motion: bool,
 
     /// Enable local ring-buffer H.264 recording.
     #[arg(long, default_value_t = false)]
@@ -360,11 +391,32 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
     if cli.audio {
         cfg.audio.enabled = true;
     }
+    if cli.backchannel {
+        cfg.audio.backchannel_enabled = true;
+    }
     if let Some(codec) = cli.audio_codec {
         cfg.audio.codec = match codec {
             CliAudioCodec::Pcmu => AudioCodecKind::Pcmu,
             CliAudioCodec::Pcma => AudioCodecKind::Pcma,
         };
+    }
+    if let Some(vcodec) = cli.codec {
+        cfg.main_stream.codec = match vcodec {
+            CliVideoCodec::H264 => VideoCodecKind::H264,
+            CliVideoCodec::H265 => VideoCodecKind::H265,
+        };
+    }
+    if cli.https {
+        cfg.tls.https_enabled = true;
+    }
+    if cli.rtsps {
+        cfg.tls.rtsps_enabled = true;
+    }
+    if let Some(port) = cli.rtsps_port {
+        cfg.tls.rtsps_port = port;
+    }
+    if cli.no_motion {
+        cfg.motion.enabled = false;
     }
     if cli.record {
         cfg.recording.enabled = true;

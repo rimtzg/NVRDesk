@@ -1,5 +1,6 @@
-//! Video processing pipeline: scaling, visual overlays, JPEG snapshots, and SIMD YUV420p conversion.
+//! Video processing pipeline: scaling, visual overlays, privacy masks, motion detection, JPEG & I420.
 
+pub mod motion;
 pub mod overlay;
 
 use fast_image_resize::{
@@ -8,7 +9,8 @@ use fast_image_resize::{
 };
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
 use nvrdesk_core::{
-    I420Frame, InputOverlaySnapshot, NvrDeskError, PipPosition, PixelFormat, RawVideoFrame,
+    I420Frame, InputOverlaySnapshot, NvrDeskError, PipPosition, PixelFormat, PosOverlaySnapshot,
+    RawVideoFrame,
 };
 use yuvutils_rs::{
     BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
@@ -56,16 +58,17 @@ impl FrameProcessor {
         }
     }
 
-    /// Scales (if needed), composites optional webcam PiP + input overlays, and converts to I420.
-    pub fn process_full(
+    /// Scales, applies privacy masks, composites webcam PiP + input/POS overlays, and converts to I420.
+    pub fn process_full_with_pos(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
         overlay_snap: Option<&InputOverlaySnapshot>,
         pip: Option<(&RawVideoFrame, PipPosition, f32)>,
+        pos_snap: Option<&PosOverlaySnapshot>,
     ) -> Result<I420Frame, NvrDeskError> {
         let (dst_w, dst_h, dst_stride) =
-            self.prepare_packed(frame, max_width, overlay_snap, pip)?;
+            self.prepare_packed(frame, max_width, overlay_snap, pip, pos_snap)?;
         convert_packed_to_i420(
             &self.work_buf,
             dst_stride as u32,
@@ -74,6 +77,17 @@ impl FrameProcessor {
             frame.format,
             frame.timestamp_us,
         )
+    }
+
+    /// Scales (if needed), composites optional webcam PiP + input overlays, and converts to I420.
+    pub fn process_full(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+        pip: Option<(&RawVideoFrame, PipPosition, f32)>,
+    ) -> Result<I420Frame, NvrDeskError> {
+        self.process_full_with_pos(frame, max_width, overlay_snap, pip, None)
     }
 
     /// Scales (if needed), renders `overlay` at target resolution, and converts to planar I420.
@@ -95,16 +109,18 @@ impl FrameProcessor {
         self.process_full(frame, max_width, None, None)
     }
 
-    /// Scales, composites optional PiP + `overlay`, and encodes a JPEG snapshot in memory.
-    pub fn encode_jpeg_snapshot_full(
+    /// Scales, masks, composites optional PiP + input/POS overlays, and encodes a JPEG snapshot.
+    pub fn encode_jpeg_snapshot_with_pos(
         &mut self,
         frame: &RawVideoFrame,
         max_width: u32,
         quality: u8,
         overlay_snap: Option<&InputOverlaySnapshot>,
         pip: Option<(&RawVideoFrame, PipPosition, f32)>,
+        pos_snap: Option<&PosOverlaySnapshot>,
     ) -> Result<Vec<u8>, NvrDeskError> {
-        let (dst_w, dst_h, _) = self.prepare_packed(frame, max_width, overlay_snap, pip)?;
+        let (dst_w, dst_h, _) =
+            self.prepare_packed(frame, max_width, overlay_snap, pip, pos_snap)?;
         let color_type = match frame.format {
             PixelFormat::Bgra8 => ColorType::Bgra,
             PixelFormat::Rgba8 => ColorType::Rgba,
@@ -116,6 +132,18 @@ impl FrameProcessor {
             .encode(&self.work_buf, dst_w as u16, dst_h as u16, color_type)
             .map_err(|e| NvrDeskError::Pipeline(format!("jpeg snapshot encode failed: {e}")))?;
         Ok(out)
+    }
+
+    /// Scales, composites optional PiP + `overlay`, and encodes a JPEG snapshot in memory.
+    pub fn encode_jpeg_snapshot_full(
+        &mut self,
+        frame: &RawVideoFrame,
+        max_width: u32,
+        quality: u8,
+        overlay_snap: Option<&InputOverlaySnapshot>,
+        pip: Option<(&RawVideoFrame, PipPosition, f32)>,
+    ) -> Result<Vec<u8>, NvrDeskError> {
+        self.encode_jpeg_snapshot_with_pos(frame, max_width, quality, overlay_snap, pip, None)
     }
 
     /// Scales, renders `overlay`, and encodes a JPEG snapshot in memory.
@@ -135,6 +163,7 @@ impl FrameProcessor {
         max_width: u32,
         overlay_snap: Option<&InputOverlaySnapshot>,
         pip: Option<(&RawVideoFrame, PipPosition, f32)>,
+        pos_snap: Option<&PosOverlaySnapshot>,
     ) -> Result<(u32, u32, usize), NvrDeskError> {
         let (dst_w, dst_h) = compute_target_dimensions(frame.width, frame.height, max_width);
         if dst_w == 0 || dst_h == 0 {
@@ -205,6 +234,17 @@ impl FrameProcessor {
                 .map_err(|e| NvrDeskError::Pipeline(format!("resize failed: {e}")))?;
         }
 
+        if let Some(pos_s) = pos_snap {
+            overlay::apply_privacy_masks(
+                &mut self.work_buf,
+                dst_w,
+                dst_h,
+                dst_stride,
+                frame.format,
+                &pos_s.privacy_masks,
+            );
+        }
+
         if let Some((pip_frame, pos, scale)) = pip {
             overlay::composite_pip(
                 &mut self.resizer,
@@ -227,6 +267,17 @@ impl FrameProcessor {
                 dst_stride,
                 frame.format,
                 snap,
+            );
+        }
+
+        if let Some(pos_s) = pos_snap {
+            overlay::draw_pos_snapshot(
+                &mut self.work_buf,
+                dst_w,
+                dst_h,
+                dst_stride,
+                frame.format,
+                pos_s,
             );
         }
 

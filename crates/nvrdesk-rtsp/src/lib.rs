@@ -7,7 +7,9 @@ pub mod sdp;
 pub mod server;
 
 pub use auth::RtspAuthConfig;
+pub use rtp::VideoRtpPacketizer;
+pub use sdp::{build_h264_sdp, build_stream_sdp, build_stream_sdp_full};
 pub use server::{
-    RtspRegistry, RtspServer, RtspServerConfig, RtspStreamHandle, RtspStreamSpec,
+    BackchannelSink, RtspRegistry, RtspServer, RtspServerConfig, RtspStreamHandle, RtspStreamSpec,
     normalize_stream_path,
 };

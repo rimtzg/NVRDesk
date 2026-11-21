@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=NVRDesk
+Comment=Open-source ONVIF/RTSP virtual IP camera for POS & desktop monitoring
+Exec=nvrdesk
+Terminal=false
+Type=Application
+Categories=Video;AudioVideo;Network;
