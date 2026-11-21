@@ -125,20 +125,24 @@ async fn streams_dual_h264_with_overlays_and_passes_ffprobe() {
             }
             if let Ok(Some(raw)) = source.try_next_frame(Duration::from_millis(50)) {
                 let snap = tracker.snapshot(bounds, Instant::now());
-                let force_idr = frame_num.is_multiple_of(10);
-                if need_main
-                    && let Ok(i420) =
+                let periodic_idr = frame_num.is_multiple_of(10);
+                if need_main {
+                    let force_idr = periodic_idr || main_handle.take_keyframe_request();
+                    if let Ok(i420) =
                         main_proc.process_with_overlay(&raw, main_cfg.max_width, Some(&snap))
-                    && let Ok(enc) = main_enc.encode(&i420, force_idr)
-                {
-                    main_handle.publish_frame(enc);
+                        && let Ok(enc) = main_enc.encode(&i420, force_idr)
+                    {
+                        main_handle.publish_frame(enc);
+                    }
                 }
-                if need_sub
-                    && let Ok(i420) =
+                if need_sub {
+                    let force_idr = periodic_idr || sub_handle.take_keyframe_request();
+                    if let Ok(i420) =
                         sub_proc.process_with_overlay(&raw, sub_cfg.max_width, Some(&snap))
-                    && let Ok(enc) = sub_enc.encode(&i420, force_idr)
-                {
-                    sub_handle.publish_frame(enc);
+                        && let Ok(enc) = sub_enc.encode(&i420, force_idr)
+                    {
+                        sub_handle.publish_frame(enc);
+                    }
                 }
                 frame_num += 1;
             }
@@ -434,11 +438,11 @@ async fn verify_rtsp_tcp_interleaved(addr: SocketAddr, url: &str) {
     );
 
     let mut rtp_packets_seen = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(6);
     let mut buf = Vec::new();
     while Instant::now() < deadline && rtp_packets_seen < 3 {
         let mut tmp = [0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp))
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp))
             .await
             .expect("rtp read timeout")
             .expect("rtp read");

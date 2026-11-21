@@ -38,7 +38,7 @@ crates/
 ### Prerequisites
 
 - **Rust** 1.88+ (`rustup` stable)
-- **Linux only:** `libpipewire-0.3-dev`, `libclang-dev`, `libdbus-1-dev`, `libxcb1-dev`, `libxcb-randr0-dev`, `libxcb-shm0-dev`, `libx11-dev`, `libxtst-dev`, `libxi-dev`, `pkg-config`
+- **Linux only:** `libpipewire-0.3-dev`, `libclang-dev`, `libdbus-1-dev`, `libwayland-dev`, `libdrm-dev`, `libgbm-dev`, `libxcb1-dev`, `libxcb-randr0-dev`, `libxcb-shm0-dev`, `libx11-dev`, `libxtst-dev`, `libxi-dev`, `pkg-config`
 - **macOS only:** Grant *Screen Recording* and *Accessibility / Input Monitoring* permissions to your terminal/binary in **System Settings -> Privacy & Security**
 
 ### Run

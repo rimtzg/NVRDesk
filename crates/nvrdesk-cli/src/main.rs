@@ -747,7 +747,8 @@ fn tick_stream_pipeline(
         .process_with_overlay(raw, pipe.stream_cfg.max_width, overlay)
     {
         Ok(i420) => {
-            let force_idr = now.saturating_duration_since(pipe.last_idr) >= pipe.idr_interval;
+            let force_idr = pipe.handle.take_keyframe_request()
+                || now.saturating_duration_since(pipe.last_idr) >= pipe.idr_interval;
             match encoder.encode(&i420, force_idr) {
                 Ok(encoded) => {
                     if encoded.is_keyframe {

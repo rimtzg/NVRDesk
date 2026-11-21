@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -68,6 +68,7 @@ struct StreamEntry {
     demand_count: Arc<AtomicUsize>,
     demand_tx: watch::Sender<usize>,
     play_count: Arc<AtomicUsize>,
+    keyframe_requested: Arc<AtomicBool>,
 }
 
 impl StreamEntry {
@@ -83,6 +84,7 @@ impl StreamEntry {
             demand_count: Arc::new(AtomicUsize::new(0)),
             demand_tx,
             play_count: Arc::new(AtomicUsize::new(0)),
+            keyframe_requested: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -168,6 +170,12 @@ impl RtspStreamHandle {
     #[must_use]
     pub fn active_players(&self) -> usize {
         self.entry.play_count.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` (and clears the flag) if a newly joined client requested an immediate IDR.
+    #[must_use]
+    pub fn take_keyframe_request(&self) -> bool {
+        self.entry.keyframe_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -353,6 +361,9 @@ async fn handle_client(
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(%peer_addr, skipped, "RTSP client lagged; waiting for next keyframe");
                             session.awaiting_keyframe = true;
+                            if let Some(entry) = &session.stream {
+                                entry.keyframe_requested.store(true, Ordering::Release);
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
@@ -559,6 +570,7 @@ async fn handle_request(
                 });
                 session.playing = true;
                 session.awaiting_keyframe = true;
+                entry.keyframe_requested.store(true, Ordering::Release);
                 *frame_rx = Some(entry.frame_tx.subscribe());
                 info!(%peer_addr, path = %entry.stream_path, session = %session.id, active_players = prev + 1, "RTSP client started PLAY");
             }
