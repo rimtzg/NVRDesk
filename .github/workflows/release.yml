@@ -2,6 +2,8 @@ name: Release Packages
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -109,11 +111,13 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: package
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -125,7 +129,12 @@ jobs:
         id: meta
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            TAG="${{ github.ref_name }}"
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              TAG="${{ github.ref_name }}"
+            else
+              CARGO_VER="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+              TAG="v${CARGO_VER}"
+            fi
             if [[ "$TAG" == *-* ]]; then
               PRERELEASE=true
             else

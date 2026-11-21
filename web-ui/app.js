@@ -40,12 +40,25 @@ function populateMicSelect(el, items, selectedName) {
 }
 
 async function loadInitial() {
-  const [devices, cfg] = await Promise.all([
+  const [devices, cfg, templates] = await Promise.all([
     fetchJson("/api/v1/devices"),
     fetchJson("/api/v1/config"),
+    fetchJson("/api/v1/fleet/templates"),
   ]);
   currentConfig = cfg;
 
+  const tplSelect = document.getElementById("fleet-template-select");
+  tplSelect.innerHTML = "";
+  for (const tpl of templates || []) {
+    const opt = document.createElement("option");
+    opt.value = tpl.name;
+    opt.textContent = tpl.name;
+    if (cfg.fleet && cfg.fleet.template === tpl.name) opt.selected = true;
+    tplSelect.appendChild(opt);
+  }
+
+  document.getElementById("cfg-source-kind").value = cfg.source.kind || "screen";
+  document.getElementById("cfg-source-uri").value = cfg.source.uri || "";
   populateSelect(document.getElementById("cfg-display"), devices.monitors, cfg.source.display, "Primary Display");
   populateSelect(document.getElementById("cfg-webcam-device"), devices.webcams, cfg.webcam.device_index, "No Webcam Found");
   populateMicSelect(document.getElementById("cfg-audio-device"), devices.microphones, cfg.audio.device_name);
@@ -75,6 +88,12 @@ async function loadInitial() {
   document.getElementById("cfg-privacy-masks").value = JSON.stringify(
     (cfg.pos && cfg.pos.privacy_masks) ? cfg.pos.privacy_masks : []
   );
+
+  document.getElementById("cfg-srt-enabled").checked = cfg.srt ? cfg.srt.enabled : false;
+  document.getElementById("cfg-srt-mode").value = cfg.srt ? cfg.srt.mode : "caller";
+  document.getElementById("cfg-srt-target").value = (cfg.srt && cfg.srt.target) ? cfg.srt.target : "";
+  document.getElementById("cfg-srt-latency").value = cfg.srt ? cfg.srt.latency_ms : 120;
+  document.getElementById("cfg-fleet-id").value = cfg.fleet ? `${cfg.fleet.site}/${cfg.fleet.terminal_id}` : "default-site/pos-01";
 }
 
 async function refreshStatus() {
@@ -101,6 +120,7 @@ async function refreshStatus() {
       st.onvif_enabled ? "ONVIF" : null,
       st.https_enabled ? "HTTPS" : null,
       st.rtsps_port ? "RTSPS" : null,
+      st.srt && st.srt.enabled ? (st.srt.connected ? "SRT:Live" : "SRT:Wait") : null,
     ].filter(Boolean).join(" / ") || "Disabled";
     document.getElementById("stat-onvif").textContent = secMode;
 
@@ -141,6 +161,9 @@ document.getElementById("toggle-pause-btn").addEventListener("click", async (e) 
 document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   if (!currentConfig) return;
   const updated = structuredClone(currentConfig);
+  updated.source.kind = document.getElementById("cfg-source-kind").value;
+  const sourceUri = document.getElementById("cfg-source-uri").value.trim();
+  updated.source.uri = sourceUri ? sourceUri : null;
   updated.source.display = Number(document.getElementById("cfg-display").value) || 0;
   updated.encoder.backend = document.getElementById("cfg-encoder-backend").value;
   updated.main_stream.codec = document.getElementById("cfg-main-codec").value;
@@ -178,6 +201,21 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   } catch (maskErr) {
     document.getElementById("save-msg").textContent = `Invalid Privacy Masks JSON: ${maskErr.message}`;
     return;
+  }
+
+  updated.srt = updated.srt || {};
+  updated.srt.enabled = document.getElementById("cfg-srt-enabled").checked;
+  updated.srt.mode = document.getElementById("cfg-srt-mode").value;
+  const srtTarget = document.getElementById("cfg-srt-target").value.trim();
+  updated.srt.target = srtTarget ? srtTarget : null;
+  updated.srt.latency_ms = Math.max(20, Number(document.getElementById("cfg-srt-latency").value) || 120);
+
+  const fleetRaw = document.getElementById("cfg-fleet-id").value.trim();
+  if (fleetRaw.includes("/")) {
+    const [site, terminalId] = fleetRaw.split("/", 2);
+    updated.fleet = updated.fleet || {};
+    if (site.trim()) updated.fleet.site = site.trim();
+    if (terminalId.trim()) updated.fleet.terminal_id = terminalId.trim();
   }
 
   const msg = document.getElementById("save-msg");
@@ -219,4 +257,29 @@ document.getElementById("clear-osd-btn").addEventListener("click", async () => {
   await fetch("/api/v1/osd/text", { method: "DELETE" });
   document.getElementById("osd-text-input").value = "";
   await refreshStatus();
+});
+
+document.getElementById("apply-template-btn").addEventListener("click", async () => {
+  const tpl = document.getElementById("fleet-template-select").value;
+  const fleetRaw = document.getElementById("cfg-fleet-id").value.trim();
+  const overrides = {};
+  if (fleetRaw.includes("/")) {
+    const [site, terminalId] = fleetRaw.split("/", 2);
+    if (site.trim()) overrides.site = site.trim();
+    if (terminalId.trim()) overrides.terminal_id = terminalId.trim();
+  }
+  const msg = document.getElementById("save-msg");
+  try {
+    currentConfig = await fetchJson("/api/v1/fleet/apply-template", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template: tpl, overrides }),
+    });
+    await loadInitial();
+    await refreshStatus();
+    msg.textContent = `Applied fleet template '${tpl}'.`;
+    setTimeout(() => { msg.textContent = ""; }, 3000);
+  } catch (err) {
+    msg.textContent = `Template apply failed: ${err.message}`;
+  }
 });

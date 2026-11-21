@@ -257,6 +257,9 @@ impl ServerState {
     }
 }
 
+/// RAII demand token keeping capture/encoding active while held by an external consumer (e.g. SRT).
+pub struct StreamDemandGuard(#[allow(dead_code)] DemandGuard);
+
 struct DemandGuard {
     count: Arc<AtomicUsize>,
     tx: watch::Sender<usize>,
@@ -324,6 +327,23 @@ impl RtspStreamHandle {
     #[must_use]
     pub fn take_keyframe_request(&self) -> bool {
         self.entry.keyframe_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Requests an immediate IDR keyframe from the video encoder pipeline.
+    pub fn request_keyframe(&self) {
+        self.entry.keyframe_requested.store(true, Ordering::Release);
+    }
+
+    /// Acquires a RAII demand token so the encoder emits frames while an external sink is active.
+    #[must_use]
+    pub fn acquire_demand(&self) -> StreamDemandGuard {
+        StreamDemandGuard(self.entry.add_demand())
+    }
+
+    /// Subscribes to live encoded H.264/H.265 access units on this stream.
+    #[must_use]
+    pub fn subscribe_video(&self) -> broadcast::Receiver<Arc<EncodedFrame>> {
+        self.entry.frame_tx.subscribe()
     }
 }
 

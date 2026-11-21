@@ -20,8 +20,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use nvrdesk_capture::{
-    AudioCaptureSource, AudioOutputSink, CaptureSource, ScreenCaptureSource, TestPatternSource,
-    WebcamCaptureSource, capture_single_screen_frame, focused_window_title,
+    AudioCaptureSource, AudioOutputSink, CaptureSource, FfmpegPullSource, ScreenCaptureSource,
+    TestPatternSource, WebcamCaptureSource, capture_single_screen_frame, focused_window_title,
 };
 use nvrdesk_codec::{
     VideoEncoder,
@@ -30,8 +30,8 @@ use nvrdesk_codec::{
 };
 use nvrdesk_core::{
     CaptureSourceKind, EncoderConfig, InputOverlaySnapshot, MonitorBounds, NvrDeskConfig,
-    NvrDeskError, PipPosition, PosOverlaySnapshot, RawVideoFrame, StreamConfig, VideoCodecKind,
-    WebcamMode, tls::build_tls_server_config,
+    NvrDeskError, PipPosition, PosOverlaySnapshot, RawVideoFrame, SourceConfig, StreamConfig,
+    VideoCodecKind, WebcamMode, tls::build_tls_server_config,
 };
 use nvrdesk_input::InputTracker;
 use nvrdesk_onvif::{
@@ -41,7 +41,7 @@ use nvrdesk_onvif::{
 use nvrdesk_pipeline::{FrameProcessor, compute_target_dimensions, motion::MotionDetector};
 use nvrdesk_rtsp::{
     BackchannelSink, RtspAuthConfig, RtspRegistry, RtspServer, RtspStreamHandle, RtspStreamSpec,
-    normalize_stream_path,
+    SrtStats, normalize_stream_path, spawn_srt_manager,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -53,7 +53,9 @@ use uuid::Uuid;
 use crate::{
     pos_osd::PosOsdStore,
     recorder::{RecordingStats, RingRecorder},
-    web_ui::{DaemonSharedState, DaemonStatus, build_endpoints, build_web_ui_router},
+    web_ui::{
+        DaemonSharedState, DaemonStatus, build_endpoints, build_web_ui_router, select_srt_handle,
+    },
 };
 
 const IDLE_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -149,6 +151,12 @@ impl DaemonHandle {
                 .read()
                 .expect("rec lock")
                 .clone(),
+            srt: self
+                .shared
+                .srt_stats
+                .read()
+                .expect("srt stats lock")
+                .clone(),
             endpoints: build_endpoints(
                 &cfg,
                 &self.shared.display_ip,
@@ -216,12 +224,7 @@ impl SnapshotProvider for LiveSnapshotProvider {
         } else if cfg.source.kind == CaptureSourceKind::Screen {
             capture_single_screen_frame(cfg.source.display)?
         } else {
-            let mut src = build_screen_source(
-                cfg.source.kind,
-                cfg.source.display,
-                5,
-                cfg.source.show_cursor,
-            );
+            let mut src = build_screen_source(&cfg.source, &cfg.encoder.ffmpeg_path, 5);
             src.start()?;
             let frame = src
                 .try_next_frame(Duration::from_millis(1500))?
@@ -461,6 +464,16 @@ pub async fn start_daemon(
     let sub_frames = Arc::new(AtomicU64::new(0));
     let active_encoder = Arc::new(RwLock::new("idle".to_string()));
     let recording_stats = Arc::new(RwLock::new(RecordingStats::default()));
+    let srt_stats = Arc::new(RwLock::new(SrtStats {
+        enabled: cfg.srt.enabled,
+        mode: cfg.srt.mode,
+        target: cfg.srt.target.clone(),
+        ..Default::default()
+    }));
+    let (srt_cfg_tx, srt_cfg_rx) = watch::channel(cfg.srt.clone());
+    let initial_srt_handle = select_srt_handle(&cfg.srt.source_stream, &main_handle, &sub_handle);
+    let (srt_stream_tx, srt_stream_rx) = watch::channel(Some(initial_srt_handle));
+    let sub_handle_slot = Arc::new(RwLock::new(sub_handle.clone()));
     let paused = Arc::new(AtomicBool::new(false));
     let config_gen = Arc::new(AtomicU64::new(0));
 
@@ -476,6 +489,11 @@ pub async fn start_daemon(
         sub_frames: Arc::clone(&sub_frames),
         active_encoder: Arc::clone(&active_encoder),
         recording_stats: Arc::clone(&recording_stats),
+        srt_stats: Arc::clone(&srt_stats),
+        srt_cfg_tx,
+        srt_stream_tx: srt_stream_tx.clone(),
+        main_handle: main_handle.clone(),
+        sub_handle_slot: Arc::clone(&sub_handle_slot),
         active_players_fn,
         display_ip,
         rtsp_port: rtsp_addr.port(),
@@ -625,6 +643,14 @@ pub async fn start_daemon(
         info!(endpoint = %ep.label, url = %ep.url, "endpoint ready");
     }
 
+    let _srt_task = spawn_srt_manager(
+        srt_cfg_rx,
+        srt_stream_rx,
+        Arc::clone(&srt_stats),
+        Arc::clone(&paused),
+        Arc::clone(&shutdown),
+    );
+
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_handle = thread::Builder::new()
         .name("nvrdesk-daemon-worker".into())
@@ -636,6 +662,8 @@ pub async fn start_daemon(
                 rtsp_registry,
                 main_handle,
                 sub_handle,
+                sub_handle_slot,
+                srt_stream_tx,
                 webcam_handle,
                 tracker_arc,
                 pos_osd,
@@ -697,16 +725,34 @@ async fn serve_https_router(
 }
 
 fn build_screen_source(
-    kind: CaptureSourceKind,
-    display_index: usize,
+    source: &SourceConfig,
+    ffmpeg_path: &str,
     fps: u32,
-    show_cursor: bool,
 ) -> Box<dyn CaptureSource> {
-    match kind {
-        CaptureSourceKind::Screen => {
-            Box::new(ScreenCaptureSource::new(display_index, fps, show_cursor))
+    match source.kind {
+        CaptureSourceKind::Screen => Box::new(ScreenCaptureSource::new(
+            source.display,
+            fps,
+            source.show_cursor,
+        )),
+        CaptureSourceKind::TestPattern => {
+            let w = source.width.unwrap_or(1280);
+            let h = source.height.unwrap_or(720);
+            Box::new(TestPatternSource::new(w, h, fps))
         }
-        CaptureSourceKind::TestPattern => Box::new(TestPatternSource::new(1280, 720, fps)),
+        CaptureSourceKind::Mp4
+        | CaptureSourceKind::Mjpeg
+        | CaptureSourceKind::Rtmp
+        | CaptureSourceKind::RtspRelay
+        | CaptureSourceKind::FfmpegUri => Box::new(FfmpegPullSource::new(
+            source.kind,
+            source.uri.clone().unwrap_or_default(),
+            ffmpeg_path.to_string(),
+            source.loop_input,
+            source.width.unwrap_or(1280),
+            source.height.unwrap_or(720),
+            fps,
+        )),
     }
 }
 
@@ -782,6 +828,8 @@ fn reconcile_streams(
     main_pipe: &mut StreamPipeline,
     sub_pipe: &mut Option<StreamPipeline>,
     active_sub_path: &mut Option<String>,
+    sub_handle_slot: &Arc<RwLock<Option<RtspStreamHandle>>>,
+    srt_stream_tx: &watch::Sender<Option<RtspStreamHandle>>,
     webcam_pipe: &mut Option<StreamPipeline>,
     active_webcam_path: &mut Option<String>,
     sub_frames: &Arc<AtomicU64>,
@@ -841,12 +889,22 @@ fn reconcile_streams(
             }
         }
         *active_sub_path = Some(norm_sub_path);
+        *sub_handle_slot.write().expect("sub handle lock") =
+            sub_pipe.as_ref().map(|p| p.handle.clone());
     } else {
         if let Some(old_path) = active_sub_path.take() {
             registry.remove_stream(&old_path);
         }
         *sub_pipe = None;
+        *sub_handle_slot.write().expect("sub handle lock") = None;
     }
+
+    let next_srt_handle = select_srt_handle(
+        &cfg.srt.source_stream,
+        &main_pipe.handle,
+        &sub_handle_slot.read().expect("sub handle lock"),
+    );
+    let _ = srt_stream_tx.send(Some(next_srt_handle));
 
     let norm_cam_path = normalize_stream_path(&cfg.webcam.channel_path);
     if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
@@ -895,6 +953,8 @@ fn run_worker(
     rtsp_registry: RtspRegistry,
     main_handle: RtspStreamHandle,
     sub_handle: Option<RtspStreamHandle>,
+    sub_handle_slot: Arc<RwLock<Option<RtspStreamHandle>>>,
+    srt_stream_tx: watch::Sender<Option<RtspStreamHandle>>,
     webcam_handle: Option<RtspStreamHandle>,
     tracker_arc: Arc<RwLock<InputTracker>>,
     pos_osd: Arc<PosOsdStore>,
@@ -962,6 +1022,8 @@ fn run_worker(
                 &mut main_pipe,
                 &mut sub_pipe,
                 &mut active_sub_path,
+                &sub_handle_slot,
+                &srt_stream_tx,
                 &mut webcam_pipe,
                 &mut active_webcam_path,
                 &sub_frames,
@@ -1011,12 +1073,7 @@ fn run_worker(
             )
             .max(1);
 
-        let mut screen_src = build_screen_source(
-            cfg.source.kind,
-            cfg.source.display,
-            base_fps,
-            cfg.source.show_cursor,
-        );
+        let mut screen_src = build_screen_source(&cfg.source, &cfg.encoder.ffmpeg_path, base_fps);
         let screen_started = if need_desktop {
             if let Err(err) = screen_src.start() {
                 error!(error = %err, source = %screen_src.name(), "failed to start screen source");

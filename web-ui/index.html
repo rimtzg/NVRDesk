@@ -89,6 +89,22 @@
         </div>
         <form id="cfg-form" class="form-grid">
           <label>
+            Video Source
+            <select id="cfg-source-kind">
+              <option value="screen">Desktop Screen</option>
+              <option value="test_pattern">Test Pattern</option>
+              <option value="mp4">MP4 File (FFmpeg)</option>
+              <option value="mjpeg">Legacy MJPEG Camera</option>
+              <option value="rtmp">RTMP Stream</option>
+              <option value="rtsp_relay">Upstream RTSP Relay</option>
+              <option value="ffmpeg_uri">Generic FFmpeg URI</option>
+            </select>
+          </label>
+          <label>
+            Source URI / File Path
+            <input id="cfg-source-uri" type="text" placeholder="/path/demo.mp4 or http://cam/mjpg" />
+          </label>
+          <label>
             Monitor
             <select id="cfg-display"></select>
           </label>
@@ -207,6 +223,39 @@
           <label class="full-span">
             POS Privacy Masks JSON (normalized 0.0-1.0: [{"x":0.7,"y":0.8,"width":0.25,"height":0.15,"label":"PIN"}])
             <textarea id="cfg-privacy-masks" rows="2"></textarea>
+          </label>
+
+          <hr class="divider" />
+
+          <label class="checkbox-row">
+            <input id="cfg-srt-enabled" type="checkbox" />
+            Enable SRT WAN Push
+          </label>
+          <label>
+            SRT Mode
+            <select id="cfg-srt-mode">
+              <option value="caller">Caller (push to remote VMS)</option>
+              <option value="listener">Listener (wait incoming)</option>
+            </select>
+          </label>
+          <label>
+            SRT Target (host:port)
+            <input id="cfg-srt-target" type="text" placeholder="vms.example.com:9000" />
+          </label>
+          <label>
+            SRT Latency (ms)
+            <input id="cfg-srt-latency" type="number" min="20" step="20" />
+          </label>
+          <label>
+            Fleet Site / Terminal ID
+            <input id="cfg-fleet-id" type="text" placeholder="store-01/pos-01" />
+          </label>
+          <label>
+            Fleet Template Quick-Apply
+            <div class="osd-actions">
+              <select id="fleet-template-select" class="select-sm"></select>
+              <button id="apply-template-btn" type="button" class="btn btn-secondary btn-sm">Apply</button>
+            </div>
           </label>
         </form>
         <p id="save-msg" class="save-msg"></p>

@@ -1,6 +1,7 @@
 //! Video & audio capture sources for NVRDesk (screen + cursor, webcam, microphone, test pattern).
 
 pub mod audio;
+pub mod ffmpeg_source;
 pub mod webcam;
 
 use std::sync::{
@@ -12,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub use audio::{AudioCaptureSource, AudioOutputSink, list_microphones};
+pub use ffmpeg_source::{FfmpegPullSource, build_ffmpeg_pull_args};
 use nvrdesk_core::{
     DeviceEntry, DeviceInventory, MonitorBounds, NvrDeskError, PixelFormat, RawVideoFrame,
 };

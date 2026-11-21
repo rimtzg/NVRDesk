@@ -9,19 +9,31 @@ use std::sync::{
 };
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use nvrdesk_core::{
-    AudioCodecKind, CaptureSourceKind, EncoderBackendKind, KeystrokeMode, NvrDeskConfig,
-    VideoCodecKind, WebcamMode,
+    AudioCodecKind, CaptureSourceKind, EncoderBackendKind, FleetOverrides, KeystrokeMode,
+    NvrDeskConfig, SrtMode, VideoCodecKind, WebcamMode, build_template_config,
+    list_fleet_templates,
 };
 use nvrdesk_daemon::start_daemon;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliSourceKind {
     Screen,
     TestPattern,
+    Mp4,
+    Mjpeg,
+    Rtmp,
+    RtspRelay,
+    FfmpegUri,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSrtMode {
+    Caller,
+    Listener,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -64,9 +76,24 @@ enum CliVideoCodec {
     about = "NVRDesk: Open-source ONVIF/RTSP virtual IP camera for POS & desktop monitoring"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Path to TOML configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Initialize configuration from a built-in fleet template (e.g. `pos-cashier`, `pci-strict`).
+    #[arg(long)]
+    template: Option<String>,
+
+    /// Store / site identifier for fleet inventory and ONVIF UUID derivation.
+    #[arg(long)]
+    site: Option<String>,
+
+    /// POS terminal identifier for fleet inventory and ONVIF UUID derivation.
+    #[arg(long)]
+    terminal_id: Option<String>,
 
     /// Print the effective TOML configuration and exit.
     #[arg(long, default_value_t = false)]
@@ -100,9 +127,17 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_discovery: bool,
 
-    /// Video source backend.
+    /// Video source backend (`screen`, `test-pattern`, `mp4`, `mjpeg`, `rtmp`, `rtsp-relay`, `ffmpeg-uri`).
     #[arg(long, value_enum)]
     source: Option<CliSourceKind>,
+
+    /// Input path or URI for FFmpeg pull sources (`mp4`, `mjpeg`, `rtmp`, `rtsp-relay`, `ffmpeg-uri`).
+    #[arg(long)]
+    source_uri: Option<String>,
+
+    /// Disable looping when playing MP4/file sources.
+    #[arg(long, default_value_t = false)]
+    no_loop: bool,
 
     /// Display index (0 = primary) when using `--source screen`.
     #[arg(long)]
@@ -211,6 +246,80 @@ struct Cli {
     /// Keep capturing and encoding even when zero RTSP clients are connected.
     #[arg(long, default_value_t = false)]
     always_on: bool,
+
+    /// SRT transport mode (`caller` or `listener`) — enables SRT when paired with `--srt-target`.
+    #[arg(long, value_enum)]
+    srt_mode: Option<CliSrtMode>,
+
+    /// SRT destination/bind address in `host:port` form (e.g. `vms.example.com:9000`).
+    #[arg(long)]
+    srt_target: Option<String>,
+
+    /// SRT stream ID access control string (e.g. `#!::r=pos-01,m=publish`).
+    #[arg(long)]
+    srt_stream_id: Option<String>,
+
+    /// Optional SRT AES passphrase (10-79 characters).
+    #[arg(long)]
+    srt_passphrase: Option<String>,
+
+    /// SRT latency buffer in milliseconds (default 120).
+    #[arg(long)]
+    srt_latency_ms: Option<u32>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// POS fleet provisioning templates, TOML generation, and config validation.
+    Fleet {
+        #[command(subcommand)]
+        action: FleetCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FleetCommands {
+    /// List built-in POS and enterprise fleet templates.
+    Templates {
+        /// Output templates as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Generate a terminal `nvrdesk.toml` from a built-in fleet template.
+    Init {
+        /// Template name (`pos-cashier`, `pos-self-checkout`, `kiosk-audit`, `pci-strict`, `cloud-srt`).
+        template: String,
+        /// Write generated TOML to file (prints to stdout when omitted).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Store / branch identifier.
+        #[arg(long)]
+        site: Option<String>,
+        /// Terminal / register identifier.
+        #[arg(long)]
+        terminal_id: Option<String>,
+        /// Override ONVIF camera display name.
+        #[arg(long)]
+        camera_name: Option<String>,
+        /// Optional RTSP & ONVIF username.
+        #[arg(long)]
+        username: Option<String>,
+        /// Optional RTSP & ONVIF password.
+        #[arg(long)]
+        password: Option<String>,
+        /// Optional remote SRT endpoint (`host:port`).
+        #[arg(long)]
+        srt_target: Option<String>,
+        /// Optional SRT encryption passphrase (10-79 chars).
+        #[arg(long)]
+        srt_passphrase: Option<String>,
+    },
+    /// Validate an `nvrdesk.toml` configuration before deployment.
+    Validate {
+        /// Path to configuration file (validates defaults when omitted).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -222,7 +331,20 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut cfg = if let Some(path) = &cli.config {
+    if let Some(Commands::Fleet { action }) = cli.command {
+        return handle_fleet_command(action);
+    }
+
+    let mut cfg = if let Some(template_name) = &cli.template {
+        build_template_config(
+            template_name,
+            &FleetOverrides {
+                site: cli.site.clone(),
+                terminal_id: cli.terminal_id.clone(),
+                ..Default::default()
+            },
+        )?
+    } else if let Some(path) = &cli.config {
         if path.exists() {
             NvrDeskConfig::from_toml_file(path)?
         } else {
@@ -234,11 +356,23 @@ fn main() -> Result<()> {
         NvrDeskConfig::default()
     };
 
+    cfg.apply_env_overrides();
     apply_cli_overrides(&cli, &mut cfg);
 
     if cli.print_config {
         println!("{}", toml::to_string_pretty(&cfg)?);
         return Ok(());
+    }
+
+    let validation = cfg.validate();
+    for w in &validation.warnings {
+        warn!(warning = %w, "configuration warning");
+    }
+    if !validation.valid {
+        anyhow::bail!(
+            "invalid configuration:\n - {}",
+            validation.errors.join("\n - ")
+        );
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -306,7 +440,91 @@ async fn wait_shutdown_flag(flag: &AtomicBool) {
     }
 }
 
+fn handle_fleet_command(action: FleetCommands) -> Result<()> {
+    match action {
+        FleetCommands::Templates { json } => {
+            let templates = list_fleet_templates();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&templates)?);
+            } else {
+                for tpl in templates {
+                    println!(
+                        "{:<20} {}\n  recommended: {}\n",
+                        tpl.name, tpl.description, tpl.recommended_for
+                    );
+                }
+            }
+            Ok(())
+        }
+        FleetCommands::Init {
+            template,
+            out,
+            site,
+            terminal_id,
+            camera_name,
+            username,
+            password,
+            srt_target,
+            srt_passphrase,
+        } => {
+            let cfg = build_template_config(
+                &template,
+                &FleetOverrides {
+                    site,
+                    terminal_id,
+                    camera_name,
+                    username,
+                    password,
+                    srt_target,
+                    srt_passphrase,
+                    ..Default::default()
+                },
+            )?;
+            let toml_text = toml::to_string_pretty(&cfg)?;
+            if let Some(path) = out {
+                cfg.save_toml_file(&path)?;
+                println!("wrote fleet configuration to {}", path.display());
+            } else {
+                println!("{toml_text}");
+            }
+            Ok(())
+        }
+        FleetCommands::Validate { config } => {
+            let cfg = match config {
+                Some(path) => NvrDeskConfig::from_toml_file(&path)?,
+                None => NvrDeskConfig::default(),
+            };
+            let report = cfg.validate();
+            for warning in &report.warnings {
+                eprintln!("WARN: {warning}");
+            }
+            if !report.valid {
+                for err in &report.errors {
+                    eprintln!("ERROR: {err}");
+                }
+                anyhow::bail!(
+                    "configuration validation failed ({} error(s))",
+                    report.errors.len()
+                );
+            }
+            println!(
+                "Configuration OK ({} warning(s), site={}, terminal={})",
+                report.warnings.len(),
+                cfg.fleet.site,
+                cfg.fleet.terminal_id
+            );
+            Ok(())
+        }
+    }
+}
+
 fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
+    if let Some(site) = &cli.site {
+        cfg.fleet.site = site.clone();
+    }
+    if let Some(tid) = &cli.terminal_id {
+        cfg.fleet.terminal_id = tid.clone();
+    }
     if let Some(bind) = cli.bind {
         cfg.rtsp.bind = bind.to_string();
     }
@@ -332,7 +550,18 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
         cfg.source.kind = match source {
             CliSourceKind::Screen => CaptureSourceKind::Screen,
             CliSourceKind::TestPattern => CaptureSourceKind::TestPattern,
+            CliSourceKind::Mp4 => CaptureSourceKind::Mp4,
+            CliSourceKind::Mjpeg => CaptureSourceKind::Mjpeg,
+            CliSourceKind::Rtmp => CaptureSourceKind::Rtmp,
+            CliSourceKind::RtspRelay => CaptureSourceKind::RtspRelay,
+            CliSourceKind::FfmpegUri => CaptureSourceKind::FfmpegUri,
         };
+    }
+    if let Some(uri) = &cli.source_uri {
+        cfg.source.uri = Some(uri.clone());
+    }
+    if cli.no_loop {
+        cfg.source.loop_input = false;
     }
     if let Some(display) = cli.display {
         cfg.source.display = display;
@@ -434,5 +663,24 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
     }
     if cli.always_on {
         cfg.always_on = true;
+    }
+    if let Some(mode) = cli.srt_mode {
+        cfg.srt.mode = match mode {
+            CliSrtMode::Caller => SrtMode::Caller,
+            CliSrtMode::Listener => SrtMode::Listener,
+        };
+    }
+    if let Some(target) = &cli.srt_target {
+        cfg.srt.enabled = true;
+        cfg.srt.target = Some(target.clone());
+    }
+    if let Some(stream_id) = &cli.srt_stream_id {
+        cfg.srt.stream_id = Some(stream_id.clone());
+    }
+    if let Some(pass) = &cli.srt_passphrase {
+        cfg.srt.passphrase = Some(pass.clone());
+    }
+    if let Some(lat) = cli.srt_latency_ms {
+        cfg.srt.latency_ms = lat;
     }
 }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nvrdesk.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/NVRDesk.app/Contents/MacOS/nvrdesk</string>
+    <string>--config</string>
+    <string>/Library/Application Support/NVRDesk/nvrdesk.toml</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/nvrdesk.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/nvrdesk.err.log</string>
+</dict>
+</plist>

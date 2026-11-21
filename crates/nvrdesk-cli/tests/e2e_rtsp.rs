@@ -938,3 +938,81 @@ async fn phase3_pos_osd_media2_pullpoint_events_rtsps_and_backchannel() {
     shutdown.store(true, Ordering::Release);
     let _ = worker.join();
 }
+
+#[tokio::test]
+async fn phase4_fleet_templates_validation_and_manifest_end_to_end() {
+    use nvrdesk_core::{CaptureSourceKind, EncoderBackendKind, NvrDeskConfig};
+    use nvrdesk_daemon::start_daemon;
+
+    let mut cfg = NvrDeskConfig::default();
+    cfg.source.kind = CaptureSourceKind::TestPattern;
+    cfg.encoder.backend = EncoderBackendKind::Openh264;
+    cfg.rtsp.bind = "127.0.0.1".to_string();
+    cfg.rtsp.port = 0;
+    cfg.onvif.http_port = 0;
+    cfg.onvif.discovery_enabled = false;
+    cfg.daemon.tray_enabled = false;
+    cfg.input_overlay.enabled = false;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (handle, worker) = start_daemon(cfg, None, Arc::clone(&shutdown))
+        .await
+        .expect("start_daemon phase4");
+
+    let web_url = handle.web_ui_url();
+    let http_port: u16 = web_url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port);
+
+    let tpls = send_http(http_addr, "GET", "/api/v1/fleet/templates", &[], "").await;
+    assert!(tpls.contains("200 OK"), "{tpls}");
+    assert!(tpls.contains("pos-cashier"));
+    assert!(tpls.contains("cloud-srt"));
+
+    let json_hdr = &[("Content-Type", "application/json")];
+    let bad_cfg = r#"{"rtsp":{"bind":"not-an-ip","port":8080}}"#;
+    let val_resp = send_http(
+        http_addr,
+        "POST",
+        "/api/v1/config/validate",
+        json_hdr,
+        bad_cfg,
+    )
+    .await;
+    assert!(val_resp.contains("\"valid\":false"), "{val_resp}");
+
+    let apply_body = r#"{
+        "template":"kiosk-audit",
+        "overrides":{"site":"sucursal-norte","terminal_id":"caja-09"}
+    }"#;
+    let applied = send_http(
+        http_addr,
+        "POST",
+        "/api/v1/fleet/apply-template",
+        json_hdr,
+        apply_body,
+    )
+    .await;
+    assert!(applied.contains("200 OK"), "{applied}");
+    assert!(applied.contains("sucursal-norte"), "{applied}");
+
+    let manifest = send_http(http_addr, "GET", "/api/v1/fleet/manifest", &[], "").await;
+    assert!(manifest.contains("200 OK"), "{manifest}");
+    assert!(manifest.contains("caja-09"), "{manifest}");
+    assert!(
+        manifest.contains("NVRDESK-sucursal-norte-caja-09"),
+        "{manifest}"
+    );
+
+    let status = send_http(http_addr, "GET", "/api/v1/status", &[], "").await;
+    assert!(status.contains("200 OK"), "{status}");
+    assert!(status.contains("\"srt\""), "{status}");
+
+    shutdown.store(true, Ordering::Release);
+    let _ = worker.join();
+}

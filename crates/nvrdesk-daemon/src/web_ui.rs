@@ -23,12 +23,15 @@ use axum::{
 use bytes::Bytes;
 use futures_core::Stream;
 use nvrdesk_capture::enumerate_devices;
-use nvrdesk_core::{NvrDeskConfig, PosOsdLevel, PosOsdLine, WebcamMode};
+use nvrdesk_core::{
+    FleetOverrides, NvrDeskConfig, PosOsdLevel, PosOsdLine, SrtConfig, ValidationReport,
+    WebcamMode, build_template_config, list_fleet_templates, validate_config,
+};
 use nvrdesk_onvif::{EventBroker, OnvifEventRecord, SnapshotProvider};
-use nvrdesk_rtsp::normalize_stream_path;
+use nvrdesk_rtsp::{RtspStreamHandle, SrtStats, normalize_stream_path};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{pos_osd::PosOsdStore, recorder::RecordingStats};
 
@@ -56,6 +59,7 @@ pub struct DaemonStatus {
     pub rtsps_port: Option<u16>,
     pub backchannel_packets: u64,
     pub recording: RecordingStats,
+    pub srt: SrtStats,
     pub endpoints: Vec<EndpointInfo>,
     pub active_osd_lines: Vec<PosOsdLine>,
     pub recent_events: Vec<OnvifEventRecord>,
@@ -72,6 +76,11 @@ pub struct DaemonSharedState {
     pub sub_frames: Arc<AtomicU64>,
     pub active_encoder: Arc<RwLock<String>>,
     pub recording_stats: Arc<RwLock<RecordingStats>>,
+    pub srt_stats: Arc<RwLock<SrtStats>>,
+    pub srt_cfg_tx: watch::Sender<SrtConfig>,
+    pub srt_stream_tx: watch::Sender<Option<RtspStreamHandle>>,
+    pub main_handle: RtspStreamHandle,
+    pub sub_handle_slot: Arc<RwLock<Option<RtspStreamHandle>>>,
     pub active_players_fn: Arc<dyn Fn() -> usize + Send + Sync>,
     pub display_ip: String,
     pub rtsp_port: u16,
@@ -121,6 +130,15 @@ pub fn build_endpoints(
             url: format!("rtsp://{display_ip}:{rtsp_port}{webcam_path}"),
         });
     }
+    if cfg.srt.enabled
+        && let Some(target) = &cfg.srt.target
+        && !target.trim().is_empty()
+    {
+        endpoints.push(EndpointInfo {
+            label: format!("SRT ({:?})", cfg.srt.mode),
+            url: format!("srt://{target}"),
+        });
+    }
     if cfg.onvif.enabled {
         endpoints.push(EndpointInfo {
             label: "ONVIF Device Service".into(),
@@ -156,6 +174,10 @@ pub fn build_web_ui_router(state: DaemonSharedState) -> Router {
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/devices", get(get_devices))
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route("/api/v1/config/validate", post(post_validate_config))
+        .route("/api/v1/fleet/templates", get(get_fleet_templates))
+        .route("/api/v1/fleet/apply-template", post(post_apply_template))
+        .route("/api/v1/fleet/manifest", get(get_fleet_manifest))
         .route("/api/v1/control/pause", post(post_pause))
         .route("/api/v1/control/resume", post(post_resume))
         .route(
@@ -211,6 +233,7 @@ async fn get_status(State(state): State<DaemonSharedState>) -> Json<DaemonStatus
         rtsps_port: state.rtsps_port,
         backchannel_packets: state.backchannel_packets.load(Ordering::Relaxed),
         recording: state.recording_stats.read().expect("rec lock").clone(),
+        srt: state.srt_stats.read().expect("srt stats lock").clone(),
         endpoints: build_endpoints(
             &cfg,
             &state.display_ip,
@@ -336,18 +359,108 @@ async fn get_config(State(state): State<DaemonSharedState>) -> Json<NvrDeskConfi
     Json(cfg)
 }
 
-async fn put_config(
-    State(state): State<DaemonSharedState>,
-    Json(new_cfg): Json<NvrDeskConfig>,
-) -> Response {
+fn apply_live_config(state: &DaemonSharedState, new_cfg: NvrDeskConfig) -> Response {
+    let report = validate_config(&new_cfg);
+    if !report.valid {
+        return (StatusCode::BAD_REQUEST, Json(report)).into_response();
+    }
     if let Some(path) = &state.config_path
         && let Err(err) = new_cfg.save_toml_file(path)
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
     *state.config.write().expect("config lock") = new_cfg.clone();
+    let _ = state.srt_cfg_tx.send(new_cfg.srt.clone());
+    let srt_target_stream = select_srt_handle(
+        &new_cfg.srt.source_stream,
+        &state.main_handle,
+        &state.sub_handle_slot.read().expect("sub handle lock"),
+    );
+    let _ = state.srt_stream_tx.send(Some(srt_target_stream));
     state.config_gen.fetch_add(1, Ordering::AcqRel);
     Json(new_cfg).into_response()
+}
+
+pub(crate) fn select_srt_handle(
+    source_stream: &str,
+    main_handle: &RtspStreamHandle,
+    sub_handle: &Option<RtspStreamHandle>,
+) -> RtspStreamHandle {
+    if source_stream.eq_ignore_ascii_case("sub")
+        && let Some(sub) = sub_handle
+    {
+        return sub.clone();
+    }
+    main_handle.clone()
+}
+
+async fn put_config(
+    State(state): State<DaemonSharedState>,
+    Json(new_cfg): Json<NvrDeskConfig>,
+) -> Response {
+    apply_live_config(&state, new_cfg)
+}
+
+async fn post_validate_config(Json(cfg): Json<NvrDeskConfig>) -> Json<ValidationReport> {
+    Json(validate_config(&cfg))
+}
+
+async fn get_fleet_templates() -> Response {
+    Json(list_fleet_templates()).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyTemplateRequest {
+    template: String,
+    #[serde(default)]
+    overrides: FleetOverrides,
+}
+
+async fn post_apply_template(
+    State(state): State<DaemonSharedState>,
+    Json(req): Json<ApplyTemplateRequest>,
+) -> Response {
+    match build_template_config(&req.template, &req.overrides) {
+        Ok(cfg) => apply_live_config(&state, cfg),
+        Err(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FleetManifest {
+    version: &'static str,
+    site: String,
+    terminal_id: String,
+    template: Option<String>,
+    device_name: String,
+    serial_number: String,
+    device_uuid: Option<String>,
+    endpoints: Vec<EndpointInfo>,
+    validation: ValidationReport,
+}
+
+async fn get_fleet_manifest(State(state): State<DaemonSharedState>) -> Json<FleetManifest> {
+    let cfg = state.config.read().expect("config lock").clone();
+    let endpoints = build_endpoints(
+        &cfg,
+        &state.display_ip,
+        state.rtsp_port,
+        state.rtsps_port,
+        state.http_port,
+        state.https_enabled,
+    );
+    let validation = validate_config(&cfg);
+    Json(FleetManifest {
+        version: env!("CARGO_PKG_VERSION"),
+        site: cfg.fleet.site,
+        terminal_id: cfg.fleet.terminal_id,
+        template: cfg.fleet.template,
+        device_name: cfg.onvif.device_name,
+        serial_number: cfg.onvif.serial_number,
+        device_uuid: cfg.onvif.device_uuid,
+        endpoints,
+        validation,
+    })
 }
 
 async fn post_pause(State(state): State<DaemonSharedState>) -> StatusCode {

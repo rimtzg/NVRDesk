@@ -4,7 +4,7 @@
 
 Designed primarily for **Point-of-Sale (POS) visual auditing** and unattended 24/7 operation, NVRDesk focuses on minimal CPU/RAM usage, zero-idle encoding, and clear operator activity overlays.
 
-## Current Status: Phase 3 (POS Dynamic OSD, Privacy Masks, ONVIF Profile T, TLS & Events)
+## Current Status: All Phases Complete (`v0.4.0` — Enterprise POS Fleet, SRT & Compatibility Matrix)
 
 - [x] **Phase 0:** Cargo workspace, cross-platform CI (Windows/Linux/macOS), screen+cursor capture (`xcap`), SIMD I420 (`yuvutils-rs`), `openh264`, RTSP 1.0 + RFC 6184 RTP
 - [x] **Phase 1:**
@@ -26,9 +26,14 @@ Designed primarily for **Point-of-Sale (POS) visual auditing** and unattended 24
   - **Pure-Rust TLS Encryption (`rustls` + `rcgen`)**: optional **HTTPS** (`--https`) for Web UI / WebSocket / ONVIF SOAP and **RTSPS** (`--rtsps` on port `8322`) with self-signed SAN cert or custom PEM cert/key
   - **Audio Backchannel (VMS -> POS)**: ONVIF `a=recvonly` `trackID=2` over TCP interleaved / UDP decoded from G.711 PCMU/PCMA to `cpal` speaker output (`--backchannel`)
   - **Motion Detection & ONVIF Events (`PullPointSubscription`)**: frame-delta activity detector + `/onvif/events_service` (`CreatePullPointSubscription`, `PullMessages`, `Renew`, `Unsubscribe`) for `MotionAlarm` and `PosEvent`
-  - **Release Packaging Workflow**: [release.yml](.github/workflows/release.yml) for `.deb`/`.tar.gz` (Linux), `.dmg` (macOS), and `.msi`/`.zip` (Windows)
+  - **Release Packaging Workflow**: [release.yml](.github/workflows/release.yml) for `.deb`/`.tar.gz` (Linux), `.dmg` (macOS), `.msi`/`.zip` (Windows), and automated GitHub Releases
+- [x] **Phase 4:**
+  - **POS Fleet Management**: Built-in provisioning templates (`pos-cashier`, `pos-self-checkout`, `kiosk-audit`, `pci-strict`, `cloud-srt`), `nvrdesk fleet init|validate|templates`, `NVRDESK_*` env overrides, `/api/v1/fleet/*` endpoints, and Ansible / GPO PowerShell / `systemd` / `LaunchAgent` installers in `packaging/fleet/`
+  - **Pure-Rust SRT Transport (`srt-tokio` + MPEG-TS Muxer)**: Secure Reliable Transport (`caller`/`listener`, AES passphrase, `streamid`, 1316-byte `7*188` MPEG-TS PAT/PMT/PES) for cloud/WAN VMS relays
+  - **Additional FFmpeg Pull Sources**: `--source mp4|mjpeg|rtmp|rtsp-relay|ffmpeg-uri` (`--source-uri`) enabling MP4 test loops and legacy camera restreaming through ONVIF Profile S/T & RTSP
+  - **Public Compatibility Matrix**: Validated guide for Hikvision, Dahua, Uniview, Milestone XProtect, Nx Witness, Frigate, Shinobi, and Synology in [docs/COMPATIBILITY_MATRIX.md](docs/COMPATIBILITY_MATRIX.md)
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical plan and [docs/POS_OSD_API.md](docs/POS_OSD_API.md) for the POS Dynamic OSD & Privacy Masks API reference.
+See [docs/ROADMAP.md](docs/ROADMAP.md), [docs/POS_OSD_API.md](docs/POS_OSD_API.md), [docs/FLEET_DEPLOYMENT.md](docs/FLEET_DEPLOYMENT.md), and [docs/COMPATIBILITY_MATRIX.md](docs/COMPATIBILITY_MATRIX.md).
 
 ## Workspace Architecture
 

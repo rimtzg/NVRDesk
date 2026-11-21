@@ -1,0 +1,60 @@
+---
+# Ansible Playbook for POS Terminal Fleet Deployment of NVRDesk
+# Usage:
+#   ansible-playbook -i inventory.ini packaging/fleet/ansible/nvrdesk-pos.yml \
+#     -e "nvrdesk_site=store-042 nvrdesk_template=pos-cashier nvrdesk_username=admin nvrdesk_password=ChangeMe!"
+
+- name: Deploy NVRDesk POS Virtual IP Camera across Linux terminals
+  hosts: pos_terminals
+  become: true
+  vars:
+    nvrdesk_version: "0.4.0"
+    nvrdesk_deb_url: "https://github.com/rimtzg/NVRDesk/releases/download/v{{ nvrdesk_version }}/nvrdesk-cli_{{ nvrdesk_version }}-1_amd64.deb"
+    nvrdesk_template: "pos-cashier"
+    nvrdesk_site: "default-site"
+    nvrdesk_terminal_id: "{{ inventory_hostname }}"
+    nvrdesk_config_path: "/etc/nvrdesk/nvrdesk.toml"
+    nvrdesk_username: ""
+    nvrdesk_password: ""
+    nvrdesk_srt_target: ""
+
+  tasks:
+    - name: Ensure /etc/nvrdesk directory exists
+      ansible.builtin.file:
+        path: /etc/nvrdesk
+        state: directory
+        mode: "0755"
+
+    - name: Install NVRDesk .deb package on Debian/Ubuntu POS
+      ansible.builtin.apt:
+        deb: "{{ nvrdesk_deb_url }}"
+      when: ansible_os_family == "Debian"
+
+    - name: Generate terminal configuration from fleet template
+      ansible.builtin.command: >
+        nvrdesk fleet init {{ nvrdesk_template }}
+        --out {{ nvrdesk_config_path }}
+        --site {{ nvrdesk_site }}
+        --terminal-id {{ nvrdesk_terminal_id }}
+        {% if nvrdesk_username %}--username {{ nvrdesk_username }}{% endif %}
+        {% if nvrdesk_password %}--password {{ nvrdesk_password }}{% endif %}
+        {% if nvrdesk_srt_target %}--srt-target {{ nvrdesk_srt_target }}{% endif %}
+      args:
+        creates: "{{ nvrdesk_config_path }}"
+
+    - name: Validate terminal NVRDesk configuration
+      ansible.builtin.command: "nvrdesk fleet validate --config {{ nvrdesk_config_path }}"
+      changed_when: false
+
+    - name: Install systemd unit for POS X11/desktop user session
+      ansible.builtin.copy:
+        src: "../linux/nvrdesk.service"
+        dest: "/etc/systemd/system/nvrdesk@.service"
+        mode: "0644"
+
+    - name: Enable NVRDesk service for active POS desktop user
+      ansible.builtin.systemd:
+        name: "nvrdesk@{{ ansible_user }}.service"
+        enabled: true
+        state: restarted
+        daemon_reload: true

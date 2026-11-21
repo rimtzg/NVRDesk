@@ -1,10 +1,16 @@
 //! Core domain types, TOML configuration schema, overlay snapshots, and errors for NVRDesk.
 
+pub mod fleet;
 pub mod tls;
 
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
+pub use fleet::{
+    FleetConfig, FleetOverrides, FleetTemplateInfo, SrtConfig, SrtMode, ValidationReport,
+    apply_env_overrides, apply_fleet_overrides, build_template_config, list_fleet_templates,
+    validate_config,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -265,6 +271,27 @@ pub enum CaptureSourceKind {
     Screen,
     /// Synthetic animated SMPTE-style test pattern (for headless testing).
     TestPattern,
+    /// Local or HTTP MP4/MKV media playback via FFmpeg CLI (supports loop for POS simulation).
+    Mp4,
+    /// Legacy IP camera HTTP MJPEG restream via FFmpeg CLI.
+    Mjpeg,
+    /// Live RTMP stream ingest/restream via FFmpeg CLI.
+    Rtmp,
+    /// Upstream RTSP camera relay/restream via FFmpeg CLI.
+    RtspRelay,
+    /// Generic FFmpeg-supported input URI (`file://`, `http://`, `rtmp://`, `rtsp://`, etc.).
+    FfmpegUri,
+}
+
+impl CaptureSourceKind {
+    /// Returns `true` when this source reads frames through the external FFmpeg pull adapter.
+    #[must_use]
+    pub const fn is_ffmpeg_pull(self) -> bool {
+        matches!(
+            self,
+            Self::Mp4 | Self::Mjpeg | Self::Rtmp | Self::RtspRelay | Self::FfmpegUri
+        )
+    }
 }
 
 /// Video encoder backend preference.
@@ -534,6 +561,14 @@ pub struct SourceConfig {
     pub kind: CaptureSourceKind,
     pub display: usize,
     pub show_cursor: bool,
+    /// Input path or URI for FFmpeg pull sources (`mp4`, `mjpeg`, `rtmp`, `rtsp_relay`, `ffmpeg_uri`).
+    pub uri: Option<String>,
+    /// Loop file input indefinitely when using `mp4` / local files.
+    pub loop_input: bool,
+    /// Optional target capture width when using FFmpeg pull sources (default 1280).
+    pub width: Option<u32>,
+    /// Optional target capture height when using FFmpeg pull sources (default 720).
+    pub height: Option<u32>,
 }
 
 impl Default for SourceConfig {
@@ -542,6 +577,10 @@ impl Default for SourceConfig {
             kind: CaptureSourceKind::Screen,
             display: 0,
             show_cursor: true,
+            uri: None,
+            loop_input: true,
+            width: None,
+            height: None,
         }
     }
 }
@@ -692,6 +731,8 @@ pub struct NvrDeskConfig {
     pub pos: PosConfig,
     pub motion: MotionConfig,
     pub tls: TlsConfig,
+    pub srt: SrtConfig,
+    pub fleet: FleetConfig,
     pub rtsp: RtspConfig,
     pub onvif: OnvifConfig,
 }
@@ -720,6 +761,8 @@ impl Default for NvrDeskConfig {
             pos: PosConfig::default(),
             motion: MotionConfig::default(),
             tls: TlsConfig::default(),
+            srt: SrtConfig::default(),
+            fleet: FleetConfig::default(),
             rtsp: RtspConfig::default(),
             onvif: OnvifConfig::default(),
         }
@@ -744,6 +787,17 @@ impl NvrDeskConfig {
         }
         std::fs::write(path, content)?;
         Ok(())
+    }
+
+    /// Validates configuration invariants and returns errors and warnings.
+    #[must_use]
+    pub fn validate(&self) -> ValidationReport {
+        validate_config(self)
+    }
+
+    /// Applies `NVRDESK_*` environment variable overrides onto this configuration.
+    pub fn apply_env_overrides(&mut self) {
+        apply_env_overrides(self);
     }
 }
 

@@ -20,6 +20,7 @@ clap.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 nvrdesk-daemon = { path = "../nvrdesk-daemon" }
 nvrdesk-tray = { path = "../nvrdesk-tray" }
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

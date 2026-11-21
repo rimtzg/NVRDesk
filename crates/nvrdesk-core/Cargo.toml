@@ -18,3 +18,4 @@ rustls-pki-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+uuid.workspace = true
