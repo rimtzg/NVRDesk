@@ -468,7 +468,6 @@ window.addEventListener("pointerup", () => {
 });
 
 document.getElementById("open-masks-modal-btn").addEventListener("click", openMasksModal);
-document.getElementById("close-masks-modal-btn").addEventListener("click", closeMasksModal);
 document.getElementById("cancel-masks-btn").addEventListener("click", closeMasksModal);
 document.getElementById("add-mask-btn").addEventListener("click", () => {
   draftMasks.push({
