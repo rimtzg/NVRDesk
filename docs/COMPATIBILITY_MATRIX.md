@@ -77,7 +77,7 @@ cameras:
 ### 3. Cloud / Remote Matrix VMS via SRT (MediaMTX / MistServer / OBS / vMix / Nimble)
 When POS branches sit behind CG-NAT/LTE without inbound firewall ports, configure NVRDesk in **SRT Caller** mode:
 ```bash
-nvrdesk fleet init cloud-srt --site sucursal-01 --terminal-id caja-02 \
+nvrdesk fleet init cloud-srt --site store-01 --terminal-id pos-02 \
   --srt-target vms.company.com:9000 --srt-passphrase "BranchSecretPass!" --out /etc/nvrdesk/nvrdesk.toml
 ```
 NVRDesk muxes H.264/H.265 into 1316-byte aligned MPEG-TS (`PAT + PMT + PES`) chunks in pure Rust (`srt-tokio`) and pushes them to the central relay with automatic exponential backoff.
