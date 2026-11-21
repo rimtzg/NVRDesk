@@ -568,13 +568,15 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
     let cfg_resp = send_http(http_addr, "GET", "/api/v1/config", &[], "").await;
     assert!(cfg_resp.starts_with("HTTP/1.1 200 OK"));
     let cfg_body = cfg_resp.split("\r\n\r\n").nth(1).expect("cfg body");
+    assert!(!handle.tray_enabled());
     let updated_cfg = cfg_body
         .replacen(
             "\"webcam\":{\"enabled\":false",
             "\"webcam\":{\"enabled\":true",
             1,
         )
-        .replacen("\"mode\":\"pip\"", "\"mode\":\"channel\"", 1);
+        .replacen("\"mode\":\"pip\"", "\"mode\":\"channel\"", 1)
+        .replacen("\"tray_enabled\":false", "\"tray_enabled\":true", 1);
     let put_resp = send_http(
         http_addr,
         "PUT",
@@ -584,6 +586,7 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
     )
     .await;
     assert!(put_resp.starts_with("HTTP/1.1 200 OK"), "{put_resp}");
+    assert!(handle.tray_enabled());
     tokio::time::sleep(Duration::from_millis(120)).await;
     let status_after = send_http(http_addr, "GET", "/api/v1/status", &[], "").await;
     assert!(

@@ -82,6 +82,17 @@ impl DaemonHandle {
         self.shared.paused.load(Ordering::Acquire)
     }
 
+    /// Returns whether the System Tray icon should currently be shown.
+    #[must_use]
+    pub fn tray_enabled(&self) -> bool {
+        self.shared
+            .config
+            .read()
+            .expect("config lock")
+            .daemon
+            .tray_enabled
+    }
+
     /// Returns a snapshot of current daemon telemetry.
     #[must_use]
     pub fn status(&self) -> DaemonStatus {

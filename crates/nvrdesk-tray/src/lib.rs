@@ -150,6 +150,33 @@ fn open_browser(url: &str) {
     }
 }
 
+fn sync_tray_visibility(
+    menu: &mut Option<TrayMenuHandles>,
+    handle: &DaemonHandle,
+    tray_failed: &mut bool,
+) {
+    if !handle.tray_enabled() {
+        if menu.take().is_some() {
+            info!("system tray icon hidden by configuration");
+        }
+        *tray_failed = false;
+        return;
+    }
+
+    if menu.is_none() && !*tray_failed {
+        match build_tray_icon(handle) {
+            Ok(built) => {
+                info!(web_ui = %handle.web_ui_url(), "system tray icon ready");
+                *menu = Some(built);
+            }
+            Err(err) => {
+                warn!(error = %err, "system tray unavailable; continuing without tray");
+                *tray_failed = true;
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn run_macos_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -164,22 +191,18 @@ fn run_macos_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let menu = match build_tray_icon(&handle) {
-        Ok(m) => m,
-        Err(err) => {
-            warn!(error = %err, "tray icon disabled");
-            wait_for_shutdown(&shutdown);
-            return;
-        }
-    };
+    let mut menu: Option<TrayMenuHandles> = None;
+    let mut tray_failed = false;
+    sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
 
-    info!(web_ui = %handle.web_ui_url(), "macOS system tray ready");
-
-    // Pump NSApplication events periodically so Ctrl+C shutdown also exits cleanly.
+    // Pump NSApplication events periodically so Ctrl+C shutdown and dynamic tray toggling work cleanly.
     while !shutdown.load(Ordering::Acquire) {
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if handle_menu_event(&ev.id, &menu, &handle, &shutdown) {
-                return;
+        sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
+        if let Some(m) = menu.as_ref() {
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if handle_menu_event(&ev.id, m, &handle, &shutdown) {
+                    return;
+                }
             }
         }
         unsafe {
@@ -204,28 +227,24 @@ fn run_windows_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
 
-    let menu = match build_tray_icon(&handle) {
-        Ok(m) => m,
-        Err(err) => {
-            warn!(error = %err, "tray icon disabled");
-            wait_for_shutdown(&shutdown);
-            return;
-        }
-    };
-
-    info!(web_ui = %handle.web_ui_url(), "Windows system tray ready");
+    let mut menu: Option<TrayMenuHandles> = None;
+    let mut tray_failed = false;
+    sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
 
     let mut msg = MSG::default();
     while !shutdown.load(Ordering::Acquire) {
+        sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
         unsafe {
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if handle_menu_event(&ev.id, &menu, &handle, &shutdown) {
-                return;
+        if let Some(m) = menu.as_ref() {
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if handle_menu_event(&ev.id, m, &handle, &shutdown) {
+                    return;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -234,21 +253,17 @@ fn run_windows_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn run_linux_tray(handle: DaemonHandle, shutdown: Arc<AtomicBool>) {
-    let menu = match build_tray_icon(&handle) {
-        Ok(m) => m,
-        Err(err) => {
-            warn!(error = %err, "Linux system tray unavailable (headless session?); continuing without tray");
-            wait_for_shutdown(&shutdown);
-            return;
-        }
-    };
-
-    info!(web_ui = %handle.web_ui_url(), "Linux KSNI system tray ready");
+    let mut menu: Option<TrayMenuHandles> = None;
+    let mut tray_failed = false;
+    sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
 
     while !shutdown.load(Ordering::Acquire) {
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if handle_menu_event(&ev.id, &menu, &handle, &shutdown) {
-                return;
+        sync_tray_visibility(&mut menu, &handle, &mut tray_failed);
+        if let Some(m) = menu.as_ref() {
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if handle_menu_event(&ev.id, m, &handle, &shutdown) {
+                    return;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(100));

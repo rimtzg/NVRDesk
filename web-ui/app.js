@@ -55,6 +55,7 @@ async function loadInitial() {
   document.getElementById("cfg-main-bitrate").value = cfg.main_stream.bitrate_bps;
   document.getElementById("cfg-keystroke-mode").value = cfg.input_overlay.keystroke_mode;
   document.getElementById("cfg-show-clicks").checked = cfg.input_overlay.show_clicks;
+  document.getElementById("cfg-tray-enabled").checked = cfg.daemon.tray_enabled;
 
   document.getElementById("cfg-webcam-enabled").checked = cfg.webcam.enabled;
   document.getElementById("cfg-webcam-mode").value = cfg.webcam.mode;
@@ -124,6 +125,7 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   updated.main_stream.bitrate_bps = Math.max(100000, Number(document.getElementById("cfg-main-bitrate").value) || 2000000);
   updated.input_overlay.keystroke_mode = document.getElementById("cfg-keystroke-mode").value;
   updated.input_overlay.show_clicks = document.getElementById("cfg-show-clicks").checked;
+  updated.daemon.tray_enabled = document.getElementById("cfg-tray-enabled").checked;
 
   updated.webcam.enabled = document.getElementById("cfg-webcam-enabled").checked;
   updated.webcam.device_index = Number(document.getElementById("cfg-webcam-device").value) || 0;

@@ -210,10 +210,10 @@ fn main() -> Result<()> {
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let tray_enabled = cfg.daemon.tray_enabled;
+    let use_tray_loop = !cli.no_tray;
     let config_path = cli.config.clone();
 
-    if tray_enabled {
+    if use_tray_loop {
         // Run Tokio on a background thread so the OS main thread is free for the System Tray loop.
         let (tx, rx) = mpsc::sync_channel(1);
         let rt_shutdown = Arc::clone(&shutdown);
