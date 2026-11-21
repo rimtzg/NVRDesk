@@ -1,0 +1,13 @@
+[book]
+title = "NVRDesk Documentation"
+authors = ["rimtzg"]
+language = "en"
+src = "."
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/rimtzg/NVRDesk"
+edit-url-template = "https://github.com/rimtzg/NVRDesk/edit/main/docs/{path}"
+site-url = "/NVRDesk/docs/"
+no-section-label = true
