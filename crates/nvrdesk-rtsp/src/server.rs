@@ -1,6 +1,6 @@
 //! Async RTSP 1.0 server supporting multi-stream, Digest auth, audio track, TCP & UDP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
@@ -68,7 +68,7 @@ pub struct RtspStreamSpec {
 struct StreamEntry {
     stream_path: String,
     stream_name: String,
-    audio_codec: Option<AudioCodecKind>,
+    audio_codec: Arc<RwLock<Option<AudioCodecKind>>>,
     frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
     audio_tx: broadcast::Sender<Arc<EncodedAudioFrame>>,
     param_sets: Arc<RwLock<Option<(Bytes, Bytes)>>>,
@@ -91,7 +91,7 @@ impl StreamEntry {
         Arc::new(Self {
             stream_path,
             stream_name,
-            audio_codec,
+            audio_codec: Arc::new(RwLock::new(audio_codec)),
             frame_tx,
             audio_tx,
             param_sets: Arc::new(RwLock::new(None)),
@@ -101,6 +101,14 @@ impl StreamEntry {
             play_count: Arc::new(AtomicUsize::new(0)),
             keyframe_requested: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn current_audio_codec(&self) -> Option<AudioCodecKind> {
+        *self.audio_codec.read().expect("audio_codec lock")
+    }
+
+    fn set_audio_codec(&self, codec: Option<AudioCodecKind>) {
+        *self.audio_codec.write().expect("audio_codec lock") = codec;
     }
 
     fn add_demand(&self) -> DemandGuard {
@@ -113,23 +121,78 @@ impl StreamEntry {
     }
 }
 
+/// Dynamic registry for adding, updating, or removing RTSP stream mount points at runtime.
+#[derive(Clone)]
+pub struct RtspRegistry {
+    streams: Arc<RwLock<HashMap<String, Arc<StreamEntry>>>>,
+}
+
+impl RtspRegistry {
+    /// Registers a new RTSP stream (or updates the existing stream's audio codec/aliases) at runtime.
+    #[must_use]
+    pub fn add_or_update_stream(&self, spec: RtspStreamSpec) -> RtspStreamHandle {
+        let norm_path = normalize_stream_path(&spec.path);
+        let mut streams = self.streams.write().expect("streams write lock");
+
+        let entry = if let Some(existing) = streams.get(&norm_path).cloned() {
+            existing.set_audio_codec(spec.audio_codec);
+            existing
+        } else {
+            let created = StreamEntry::new(norm_path.clone(), spec.name, spec.audio_codec);
+            streams.insert(norm_path, Arc::clone(&created));
+            created
+        };
+
+        for alias in spec.aliases {
+            let norm_alias = normalize_stream_path(&alias);
+            streams
+                .entry(norm_alias)
+                .or_insert_with(|| Arc::clone(&entry));
+        }
+
+        RtspStreamHandle { entry }
+    }
+
+    /// Removes an RTSP stream and all aliases pointing to it.
+    pub fn remove_stream(&self, path: &str) {
+        let norm_path = normalize_stream_path(path);
+        let mut streams = self.streams.write().expect("streams write lock");
+        streams.retain(|_, entry| entry.stream_path != norm_path);
+    }
+
+    /// Returns total active `PLAY` sessions across all currently registered unique streams.
+    #[must_use]
+    pub fn active_players(&self) -> usize {
+        let streams = self.streams.read().expect("streams read lock");
+        let mut seen = HashSet::new();
+        let mut total = 0usize;
+        for entry in streams.values() {
+            if seen.insert(entry.stream_path.clone()) {
+                total += entry.play_count.load(Ordering::Acquire);
+            }
+        }
+        total
+    }
+}
+
 #[derive(Clone)]
 struct ServerState {
-    streams: Arc<HashMap<String, Arc<StreamEntry>>>,
+    streams: Arc<RwLock<HashMap<String, Arc<StreamEntry>>>>,
     auth: Option<RtspAuthConfig>,
     next_session_id: Arc<AtomicU64>,
 }
 
 impl ServerState {
-    fn resolve_stream_and_track(&self, uri_path: &str) -> Option<(&Arc<StreamEntry>, Option<u8>)> {
-        if let Some(exact) = self.streams.get(uri_path) {
-            return Some((exact, None));
+    fn resolve_stream_and_track(&self, uri_path: &str) -> Option<(Arc<StreamEntry>, Option<u8>)> {
+        let streams = self.streams.read().expect("streams read lock");
+        if let Some(exact) = streams.get(uri_path) {
+            return Some((Arc::clone(exact), None));
         }
         if let Some((base, track_str)) = uri_path.rsplit_once("/trackID=")
-            && let Some(entry) = self.streams.get(base)
+            && let Some(entry) = streams.get(base)
         {
             let track_id = track_str.parse::<u8>().ok();
-            return Some((entry, track_id));
+            return Some((Arc::clone(entry), track_id));
         }
         None
     }
@@ -264,7 +327,7 @@ impl RtspServer {
         }
 
         let state = ServerState {
-            streams: Arc::new(streams),
+            streams: Arc::new(RwLock::new(streams)),
             auth,
             next_session_id: Arc::new(AtomicU64::new(1000)),
         };
@@ -272,11 +335,23 @@ impl RtspServer {
         Ok((Self { listener, state }, local_addr, handles))
     }
 
+    /// Returns a dynamic registry handle allowing runtime registration/removal of RTSP streams.
+    #[must_use]
+    pub fn registry(&self) -> RtspRegistry {
+        RtspRegistry {
+            streams: Arc::clone(&self.state.streams),
+        }
+    }
+
     /// Runs the RTSP accept loop until the task is cancelled or encounters a fatal accept error.
     pub async fn serve(self) -> Result<(), NvrDeskError> {
         let addr = self.listener.local_addr()?;
-        let mut paths: Vec<&str> = self.state.streams.keys().map(String::as_str).collect();
-        paths.sort_unstable();
+        let paths: Vec<String> = {
+            let streams = self.state.streams.read().expect("streams read lock");
+            let mut list: Vec<String> = streams.keys().cloned().collect();
+            list.sort_unstable();
+            list
+        };
         info!(%addr, ?paths, auth_enabled = self.state.auth.is_some(), "RTSP server listening");
         loop {
             let (stream, peer_addr) = self.listener.accept().await?;
@@ -555,7 +630,6 @@ async fn handle_request(
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
             };
-            let entry = Arc::clone(entry);
 
             let (sps, pps) = ensure_parameter_sets(&entry).await;
             let sdp = build_stream_sdp(
@@ -563,7 +637,7 @@ async fn handle_request(
                 &entry.stream_name,
                 sps.as_deref(),
                 pps.as_deref(),
-                entry.audio_codec,
+                entry.current_audio_codec(),
             );
             let content_base = req
                 .request_uri()
@@ -578,17 +652,16 @@ async fn handle_request(
             write_rtsp_response(stream, &resp).await?;
         }
         Method::Setup => {
-            let Some((entry_ref, track_id)) = state.resolve_stream_and_track(&uri_path) else {
+            let Some((entry, track_id)) = state.resolve_stream_and_track(&uri_path) else {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
                 write_rtsp_response(stream, &resp).await?;
                 return Ok(true);
             };
-            let entry = Arc::clone(entry_ref);
 
             let is_audio_track = track_id == Some(1);
-            if is_audio_track && entry.audio_codec.is_none() {
+            if is_audio_track && entry.current_audio_codec().is_none() {
                 let resp = Response::builder(Version::V1_0, StatusCode::NotFound)
                     .header(headers::CSEQ, cseq)
                     .empty();
@@ -901,5 +974,36 @@ mod tests {
     fn normalizes_paths() {
         assert_eq!(normalize_stream_path("/stream1/"), "/stream1");
         assert_eq!(normalize_stream_path("stream2"), "/stream2");
+    }
+
+    #[tokio::test]
+    async fn registry_registers_and_removes_streams_at_runtime() {
+        let (srv, _addr, _handles) = RtspServer::bind_streams(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            vec![RtspStreamSpec {
+                path: "/stream1".into(),
+                aliases: vec!["/stream".into()],
+                name: "Main".into(),
+                audio_codec: None,
+            }],
+        )
+        .await
+        .expect("bind");
+
+        let registry = srv.registry();
+        assert!(srv.state.resolve_stream_and_track("/webcam").is_none());
+
+        let cam = registry.add_or_update_stream(RtspStreamSpec {
+            path: "/webcam".into(),
+            aliases: Vec::new(),
+            name: "Webcam".into(),
+            audio_codec: Some(AudioCodecKind::Pcmu),
+        });
+        assert!(srv.state.resolve_stream_and_track("/webcam").is_some());
+        assert_eq!(cam.entry.current_audio_codec(), Some(AudioCodecKind::Pcmu));
+
+        registry.remove_stream("/webcam");
+        assert!(srv.state.resolve_stream_and_track("/webcam").is_none());
     }
 }

@@ -8,5 +8,6 @@ pub mod server;
 
 pub use auth::RtspAuthConfig;
 pub use server::{
-    RtspServer, RtspServerConfig, RtspStreamHandle, RtspStreamSpec, normalize_stream_path,
+    RtspRegistry, RtspServer, RtspServerConfig, RtspStreamHandle, RtspStreamSpec,
+    normalize_stream_path,
 };

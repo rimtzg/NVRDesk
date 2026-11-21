@@ -20,8 +20,9 @@ use axum::{
 use bytes::Bytes;
 use futures_core::Stream;
 use nvrdesk_capture::enumerate_devices;
-use nvrdesk_core::NvrDeskConfig;
+use nvrdesk_core::{NvrDeskConfig, WebcamMode};
 use nvrdesk_onvif::SnapshotProvider;
+use nvrdesk_rtsp::normalize_stream_path;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -64,8 +65,57 @@ pub struct DaemonSharedState {
     pub active_encoder: Arc<RwLock<String>>,
     pub recording_stats: Arc<RwLock<RecordingStats>>,
     pub active_players_fn: Arc<dyn Fn() -> usize + Send + Sync>,
-    pub endpoints: Arc<Vec<EndpointInfo>>,
+    pub display_ip: String,
+    pub rtsp_port: u16,
+    pub http_port: u16,
     pub snapshots: Arc<dyn SnapshotProvider>,
+}
+
+/// Builds the current list of advertised RTSP/ONVIF/Web UI endpoints from live configuration.
+#[must_use]
+pub fn build_endpoints(
+    cfg: &NvrDeskConfig,
+    display_ip: &str,
+    rtsp_port: u16,
+    http_port: u16,
+) -> Vec<EndpointInfo> {
+    let main_path = normalize_stream_path(&cfg.main_stream.path);
+    let sub_path = normalize_stream_path(&cfg.sub_stream.path);
+    let webcam_path = normalize_stream_path(&cfg.webcam.channel_path);
+
+    let mut endpoints = vec![EndpointInfo {
+        label: "MainStream RTSP".into(),
+        url: format!("rtsp://{display_ip}:{rtsp_port}{main_path}"),
+    }];
+    if cfg.sub_stream.enabled {
+        endpoints.push(EndpointInfo {
+            label: "SubStream RTSP".into(),
+            url: format!("rtsp://{display_ip}:{rtsp_port}{sub_path}"),
+        });
+    }
+    if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+        endpoints.push(EndpointInfo {
+            label: "Webcam RTSP".into(),
+            url: format!("rtsp://{display_ip}:{rtsp_port}{webcam_path}"),
+        });
+    }
+    if cfg.onvif.enabled {
+        endpoints.push(EndpointInfo {
+            label: "ONVIF Device Service".into(),
+            url: format!("http://{display_ip}:{http_port}/onvif/device_service"),
+        });
+        endpoints.push(EndpointInfo {
+            label: "Snapshot Main".into(),
+            url: format!("http://{display_ip}:{http_port}/snapshot/main"),
+        });
+    }
+    if cfg.daemon.web_ui_enabled {
+        endpoints.push(EndpointInfo {
+            label: "Web Control Panel".into(),
+            url: format!("http://{display_ip}:{http_port}/"),
+        });
+    }
+    endpoints
 }
 
 /// Builds the Axum router for the embedded Web UI, REST API, and MJPEG preview.
@@ -121,7 +171,7 @@ async fn get_status(State(state): State<DaemonSharedState>) -> Json<DaemonStatus
         active_encoder: state.active_encoder.read().expect("encoder lock").clone(),
         onvif_enabled: cfg.onvif.enabled,
         recording: state.recording_stats.read().expect("rec lock").clone(),
-        endpoints: (*state.endpoints).clone(),
+        endpoints: build_endpoints(&cfg, &state.display_ip, state.rtsp_port, state.http_port),
     };
     Json(status)
 }

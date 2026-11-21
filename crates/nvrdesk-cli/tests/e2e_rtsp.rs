@@ -500,11 +500,17 @@ async fn send_http_raw(
     body: &str,
 ) -> Vec<u8> {
     let mut sock = TcpStream::connect(addr).await.expect("connect http");
+    let has_ct = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Type: application/soap+xml; charset=utf-8\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Length: {}\r\n",
         addr.port(),
         body.len()
     );
+    if !has_ct {
+        req.push_str("Content-Type: application/soap+xml; charset=utf-8\r\n");
+    }
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -553,10 +559,37 @@ async fn daemon_web_ui_rest_api_and_audio_rtsp_track_work_end_to_end() {
     assert!(index_resp.starts_with("HTTP/1.1 200 OK"), "{index_resp}");
     assert!(index_resp.contains("NVRDesk Control Panel"));
 
-    // 2. REST API status & pause/resume
+    // 2. REST API status, pause/resume & hot-enabling /webcam channel
     let status_resp = send_http(http_addr, "GET", "/api/v1/status", &[], "").await;
     assert!(status_resp.starts_with("HTTP/1.1 200 OK"));
     assert!(status_resp.contains("\"paused\":false"));
+    assert!(!status_resp.contains("/webcam"));
+
+    let cfg_resp = send_http(http_addr, "GET", "/api/v1/config", &[], "").await;
+    assert!(cfg_resp.starts_with("HTTP/1.1 200 OK"));
+    let cfg_body = cfg_resp.split("\r\n\r\n").nth(1).expect("cfg body");
+    let updated_cfg = cfg_body
+        .replacen(
+            "\"webcam\":{\"enabled\":false",
+            "\"webcam\":{\"enabled\":true",
+            1,
+        )
+        .replacen("\"mode\":\"pip\"", "\"mode\":\"channel\"", 1);
+    let put_resp = send_http(
+        http_addr,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        &updated_cfg,
+    )
+    .await;
+    assert!(put_resp.starts_with("HTTP/1.1 200 OK"), "{put_resp}");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let status_after = send_http(http_addr, "GET", "/api/v1/status", &[], "").await;
+    assert!(
+        status_after.contains("/webcam"),
+        "expected /webcam in hot-updated endpoints: {status_after}"
+    );
 
     let pause_resp = send_http(http_addr, "POST", "/api/v1/control/pause", &[], "").await;
     assert!(pause_resp.starts_with("HTTP/1.1 200 OK"));
