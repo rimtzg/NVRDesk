@@ -9,8 +9,13 @@ use nvrdesk_core::{
     ClickRipple, InputOverlayConfig, InputOverlaySnapshot, KeystrokeMode, MonitorBounds,
     MouseButton,
 };
-use rdevin::{Button, Event as RdevEvent, EventType as RdevEventType, Key};
+use rdevin::Key;
+#[cfg(not(target_os = "macos"))]
+use rdevin::{Button, Event as RdevEvent, EventType as RdevEventType};
 use tracing::{info, warn};
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 const MAX_KEYSTROKE_CHARS: usize = 48;
 const PRIVACY_CHECK_INTERVAL: Duration = Duration::from_millis(300);
@@ -108,7 +113,7 @@ impl InputTracker {
         }
     }
 
-    /// Starts the OS-wide `rdevin` listener on a dedicated background thread.
+    /// Starts the OS-wide input listener on a dedicated background thread.
     ///
     /// If the host OS denies accessibility / X11 hooks, logs a warning and degrades gracefully
     /// without interrupting video streaming.
@@ -119,14 +124,18 @@ impl InputTracker {
             .spawn(move || {
                 info!("global keyboard/mouse input listener starting");
                 #[cfg(target_os = "macos")]
-                info!("macOS hint: grant Accessibility / Input Monitoring permission for global keystroke & click overlays");
-
-                if let Err(err) = rdevin::listen(move |ev| {
-                    if let Some(tracked) = convert_rdev_event(&ev) {
-                        tracker.push_event(tracked, Instant::now());
+                {
+                    macos::listen(tracker);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if let Err(err) = rdevin::listen(move |ev| {
+                        if let Some(tracked) = convert_rdev_event(&ev) {
+                            tracker.push_event(tracked, Instant::now());
+                        }
+                    }) {
+                        warn!(error = ?err, "global input listener exited; click/keystroke overlays disabled");
                     }
-                }) {
-                    warn!(error = ?err, "global input listener exited; click/keystroke overlays disabled");
                 }
             })
         {
@@ -394,6 +403,7 @@ fn render_keystroke_tokens(tokens: &VecDeque<KeyToken>, mode: KeystrokeMode) -> 
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn convert_rdev_event(ev: &RdevEvent) -> Option<TrackedEvent> {
     match &ev.event_type {
         RdevEventType::MouseMove { x, y } => Some(TrackedEvent::MouseMove { x: *x, y: *y }),
@@ -430,6 +440,7 @@ fn convert_rdev_event(ev: &RdevEvent) -> Option<TrackedEvent> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 const fn map_button(btn: Button) -> MouseButton {
     match btn {
         Button::Left => MouseButton::Left,
@@ -438,7 +449,7 @@ const fn map_button(btn: Button) -> MouseButton {
     }
 }
 
-fn classify_key(key: Key) -> (String, bool, Option<ModifierKind>) {
+pub(crate) fn classify_key(key: Key) -> (String, bool, Option<ModifierKind>) {
     match key {
         Key::ControlLeft | Key::ControlRight => ("Ctrl".into(), true, Some(ModifierKind::Ctrl)),
         Key::Alt | Key::AltGr => ("Alt".into(), true, Some(ModifierKind::Alt)),
@@ -478,7 +489,7 @@ fn classify_key(key: Key) -> (String, bool, Option<ModifierKind>) {
     }
 }
 
-fn fallback_printable(key: Key) -> Option<char> {
+pub(crate) fn fallback_printable(key: Key) -> Option<char> {
     match key {
         Key::Space => Some(' '),
         Key::Num0 | Key::Kp0 => Some('0'),

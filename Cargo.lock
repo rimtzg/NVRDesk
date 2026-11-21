@@ -1619,6 +1619,9 @@ dependencies = [
 name = "nvrdesk-input"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "core-foundation",
+ "core-graphics",
+ "foreign-types",
  "nvrdesk-core",
  "rdevin",
  "tracing",
