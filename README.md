@@ -28,7 +28,7 @@ Designed primarily for **Point-of-Sale (POS) visual auditing** and unattended 24
   - **Motion Detection & ONVIF Events (`PullPointSubscription`)**: frame-delta activity detector + `/onvif/events_service` (`CreatePullPointSubscription`, `PullMessages`, `Renew`, `Unsubscribe`) for `MotionAlarm` and `PosEvent`
   - **Release Packaging Workflow**: [release.yml](.github/workflows/release.yml) for `.deb`/`.tar.gz` (Linux), `.dmg` (macOS), and `.msi`/`.zip` (Windows)
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical plan.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical plan and [docs/POS_OSD_API.md](docs/POS_OSD_API.md) for the POS Dynamic OSD & Privacy Masks API reference.
 
 ## Workspace Architecture
 
