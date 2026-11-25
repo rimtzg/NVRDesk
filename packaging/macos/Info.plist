@@ -9,9 +9,9 @@
   <key>CFBundleIdentifier</key>
   <string>io.github.rimtzg.nvrdesk</string>
   <key>CFBundleVersion</key>
-  <string>0.4.1</string>
+  <string>0.4.2</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.4.1</string>
+  <string>0.4.2</string>
   <key>CFBundleExecutable</key>
   <string>nvrdesk</string>
   <key>CFBundlePackageType</key>
