@@ -118,6 +118,7 @@ cargo run --release -p nvrdesk-cli -- --config nvrdesk.toml
 | `--no-tray` / `--no-web-ui` | `false` | Disable System Tray (headless) or Embedded Web UI |
 | `--no-substream` / `--no-overlays` / `--no-onvif` | `false` | Disable SubStream, input overlays, or ONVIF |
 | `--username` / `--password` | none | Credentials for RTSP Digest & ONVIF WS-Security |
+| `--install-service` | `false` | Linux: generate `/etc/nvrdesk/nvrdesk.toml` and enable/start `nvrdesk@<user>.service` (use with `sudo`, optional `--service-user`) |
 
 ## License
 
