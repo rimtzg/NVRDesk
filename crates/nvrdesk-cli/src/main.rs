@@ -344,7 +344,10 @@ fn main() -> Result<()> {
     }
 
     let config_path = if cli.install_service && cli.config.is_none() {
-        Some(PathBuf::from("/etc/nvrdesk/nvrdesk.toml"))
+        Some(
+            nvrdesk_core::default_snap_config_path()
+                .unwrap_or_else(|| PathBuf::from("/etc/nvrdesk/nvrdesk.toml")),
+        )
     } else {
         cli.config
             .clone()
@@ -395,7 +398,7 @@ fn main() -> Result<()> {
 
     if cli.install_service {
         let target_cfg = config_path.as_deref().expect("service config path set");
-        return install_systemd_service(target_cfg, &cfg, cli.service_user.as_deref());
+        return install_systemd_service(target_cfg, &cfg, cli.service_user.as_deref(), cli.no_tray);
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -752,14 +755,66 @@ fn render_systemd_unit(exe_path: &str, config_path: &str, display: &str) -> Stri
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn snap_autostart_desktop_path(snap_user_data: &str) -> PathBuf {
+    PathBuf::from(snap_user_data)
+        .join(".config")
+        .join("autostart")
+        .join("nvrdesk.desktop")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn render_snap_autostart_desktop(headless: bool) -> String {
+    let exec_cmd = if headless {
+        "nvrdesk.headless"
+    } else {
+        "nvrdesk"
+    };
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=NVRDesk\n\
+         Comment=Open-source ONVIF/RTSP/SRT virtual IP camera for POS & desktop monitoring\n\
+         Exec={exec_cmd}\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_snap_autostart(
+    config_path: &std::path::Path,
+    cfg: &NvrDeskConfig,
+    snap_user_data: &str,
+    headless: bool,
+) -> Result<()> {
+    cfg.save_toml_file(config_path)?;
+    let desktop_path = snap_autostart_desktop_path(snap_user_data);
+    if let Some(parent) = desktop_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&desktop_path, render_snap_autostart_desktop(headless))?;
+    println!("Configured NVRDesk Snap session autostart:");
+    println!("  Config   : {}", config_path.display());
+    println!("  Autostart: {}", desktop_path.display());
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn install_systemd_service(
     config_path: &std::path::Path,
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
+    headless: bool,
 ) -> Result<()> {
     use anyhow::Context;
     use std::process::Command;
+
+    if let Ok(snap_user_data) = std::env::var("SNAP_USER_DATA")
+        && !snap_user_data.trim().is_empty()
+    {
+        return install_snap_autostart(config_path, cfg, snap_user_data.trim(), headless);
+    }
 
     let sudo_user = std::env::var("SUDO_USER").ok();
     let env_user = std::env::var("USER").ok();
@@ -830,8 +885,9 @@ fn install_systemd_service(
     config_path: &std::path::Path,
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
+    headless: bool,
 ) -> Result<()> {
-    let _ = (config_path, cfg, explicit_user);
+    let _ = (config_path, cfg, explicit_user, headless);
     anyhow::bail!(
         "`--install-service` is only supported on Linux (systemd). Use `packaging/fleet/windows/Install-NvrDeskPos.ps1` on Windows or `packaging/fleet/macos/com.nvrdesk.agent.plist` on macOS."
     )
@@ -866,5 +922,18 @@ mod tests {
             )
         );
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_snap_autostart_desktop_and_path() {
+        let path = snap_autostart_desktop_path("/home/pos/snap/nvrdesk/42");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/pos/snap/nvrdesk/42/.config/autostart/nvrdesk.desktop")
+        );
+        let gui_desktop = render_snap_autostart_desktop(false);
+        assert!(gui_desktop.contains("Exec=nvrdesk\n"));
+        let headless_desktop = render_snap_autostart_desktop(true);
+        assert!(headless_desktop.contains("Exec=nvrdesk.headless\n"));
     }
 }
