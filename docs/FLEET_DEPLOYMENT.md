@@ -48,6 +48,11 @@ Any setting below overrides loaded TOML values automatically (highest precedence
 
 ## 2. Deployment Templates (`packaging/fleet/`)
 
+- **Linux `systemd` quick install (built into CLI):**
+  ```bash
+  sudo nvrdesk --install-service --template pos-cashier --site store-01 --terminal-id pos-01
+  ```
+  Generates `/etc/nvrdesk/nvrdesk.toml` (owned by your `$SUDO_USER` / `--service-user`), installs `/etc/systemd/system/nvrdesk@.service`, and runs `systemctl enable --now nvrdesk@<user>.service`.
 - **Linux Ansible:** [`packaging/fleet/ansible/nvrdesk-pos.yml`](../packaging/fleet/ansible/nvrdesk-pos.yml)
 - **Linux `systemd` unit:** [`packaging/fleet/linux/nvrdesk.service`](../packaging/fleet/linux/nvrdesk.service)
 - **Windows GPO / Silent MSI PowerShell:** [`packaging/fleet/windows/Install-NvrDeskPos.ps1`](../packaging/fleet/windows/Install-NvrDeskPos.ps1) (installs `.msi`, provisions config, opens firewall ports 8554/8080/3702, schedules interactive user-session task to bypass Session 0 capture isolation)

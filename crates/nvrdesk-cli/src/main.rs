@@ -266,6 +266,14 @@ struct Cli {
     /// SRT latency buffer in milliseconds (default 120).
     #[arg(long)]
     srt_latency_ms: Option<u32>,
+
+    /// Install `/etc/nvrdesk/nvrdesk.toml` and register/start a systemd user-session service (Linux).
+    #[arg(long, default_value_t = false)]
+    install_service: bool,
+
+    /// Target Linux desktop username for `--install-service` (defaults to `$SUDO_USER` / `$USER`).
+    #[arg(long)]
+    service_user: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,10 +343,13 @@ fn main() -> Result<()> {
         return handle_fleet_command(action);
     }
 
-    let config_path = cli
-        .config
-        .clone()
-        .or_else(nvrdesk_core::default_snap_config_path);
+    let config_path = if cli.install_service && cli.config.is_none() {
+        Some(PathBuf::from("/etc/nvrdesk/nvrdesk.toml"))
+    } else {
+        cli.config
+            .clone()
+            .or_else(nvrdesk_core::default_snap_config_path)
+    };
 
     let mut cfg = if let Some(template_name) = &cli.template {
         build_template_config(
@@ -352,6 +363,8 @@ fn main() -> Result<()> {
     } else if let Some(path) = &config_path {
         if path.exists() {
             NvrDeskConfig::from_toml_file(path)?
+        } else if cli.install_service {
+            NvrDeskConfig::default()
         } else {
             let default = NvrDeskConfig::default();
             default.save_toml_file(path)?;
@@ -378,6 +391,11 @@ fn main() -> Result<()> {
             "invalid configuration:\n - {}",
             validation.errors.join("\n - ")
         );
+    }
+
+    if cli.install_service {
+        let target_cfg = config_path.as_deref().expect("service config path set");
+        return install_systemd_service(target_cfg, &cfg, cli.service_user.as_deref());
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -686,5 +704,167 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
     }
     if let Some(lat) = cli.srt_latency_ms {
         cfg.srt.latency_ms = lat;
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_service_user(
+    explicit: Option<&str>,
+    sudo_user: Option<&str>,
+    env_user: Option<&str>,
+) -> Result<String> {
+    let candidate = explicit
+        .or(sudo_user)
+        .or(env_user)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match candidate {
+        Some("root") => anyhow::bail!(
+            "cannot infer non-root desktop user (running as root); pass `--service-user <desktop_user>` or invoke via `sudo nvrdesk --install-service`"
+        ),
+        Some(user) => Ok(user.to_string()),
+        None => anyhow::bail!(
+            "could not detect target Linux desktop user; pass `--service-user <username>`"
+        ),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn render_systemd_unit(exe_path: &str, config_path: &str, display: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=NVRDesk Virtual ONVIF/RTSP Camera (%i POS Desktop Session)\n\
+         After=graphical.target network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User=%i\n\
+         Environment=DISPLAY={display}\n\
+         Environment=RUST_LOG=info,xcap=warn,nokhwa=warn\n\
+         ExecStart={exe_path} --config {config_path} --no-tray\n\
+         Restart=always\n\
+         RestartSec=3\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd_service(
+    config_path: &std::path::Path,
+    cfg: &NvrDeskConfig,
+    explicit_user: Option<&str>,
+) -> Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let env_user = std::env::var("USER").ok();
+    let user = resolve_service_user(explicit_user, sudo_user.as_deref(), env_user.as_deref())?;
+
+    cfg.save_toml_file(config_path).with_context(|| {
+        format!(
+            "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+            config_path.display()
+        )
+    })?;
+
+    // Allow the desktop service user to persist updates saved from the embedded Web UI.
+    let _ = Command::new("chown").arg(&user).arg(config_path).status();
+
+    let exe_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map_or_else(
+            || "/usr/bin/nvrdesk".to_string(),
+            |p| p.display().to_string(),
+        );
+    let display = std::env::var("DISPLAY")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| ":0".to_string());
+
+    let unit_path = PathBuf::from("/etc/systemd/system/nvrdesk@.service");
+    let unit_content = render_systemd_unit(&exe_path, &config_path.display().to_string(), &display);
+    std::fs::write(&unit_path, unit_content).with_context(|| {
+        format!(
+            "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+            unit_path.display()
+        )
+    })?;
+
+    let reload = Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .context("failed to run `systemctl daemon-reload`")?;
+    if !reload.success() {
+        anyhow::bail!("`systemctl daemon-reload` exited with {reload}");
+    }
+
+    let unit_instance = format!("nvrdesk@{user}.service");
+    let enable = Command::new("systemctl")
+        .args(["enable", "--now", &unit_instance])
+        .status()
+        .with_context(|| format!("failed to enable {unit_instance}"))?;
+    if !enable.success() {
+        anyhow::bail!("`systemctl enable --now {unit_instance}` exited with {enable}");
+    }
+
+    let _ = Command::new("systemctl")
+        .args(["restart", &unit_instance])
+        .status();
+
+    println!("Installed NVRDesk systemd service:");
+    println!("  Config : {}", config_path.display());
+    println!("  Unit   : {}", unit_path.display());
+    println!("  Service: {unit_instance} (enabled & started)");
+    println!("  Logs   : journalctl -u {unit_instance} -f");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_systemd_service(
+    config_path: &std::path::Path,
+    cfg: &NvrDeskConfig,
+    explicit_user: Option<&str>,
+) -> Result<()> {
+    let _ = (config_path, cfg, explicit_user);
+    anyhow::bail!(
+        "`--install-service` is only supported on Linux (systemd). Use `packaging/fleet/windows/Install-NvrDeskPos.ps1` on Windows or `packaging/fleet/macos/com.nvrdesk.agent.plist` on macOS."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_desktop_user_from_explicit_or_sudo() {
+        assert_eq!(
+            resolve_service_user(Some("pos"), Some("other"), Some("root")).expect("explicit"),
+            "pos"
+        );
+        assert_eq!(
+            resolve_service_user(None, Some("desiteg"), Some("root")).expect("sudo"),
+            "desiteg"
+        );
+        assert!(resolve_service_user(None, None, Some("root")).is_err());
+        assert!(resolve_service_user(None, None, None).is_err());
+    }
+
+    #[test]
+    fn renders_systemd_unit_with_expected_fields() {
+        let unit = render_systemd_unit("/usr/bin/nvrdesk", "/etc/nvrdesk/nvrdesk.toml", ":0");
+        assert!(unit.contains("User=%i"));
+        assert!(unit.contains("Environment=DISPLAY=:0"));
+        assert!(
+            unit.contains(
+                "ExecStart=/usr/bin/nvrdesk --config /etc/nvrdesk/nvrdesk.toml --no-tray"
+            )
+        );
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 }
