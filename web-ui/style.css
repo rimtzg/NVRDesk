@@ -86,8 +86,46 @@ body {
 .preview-wrap img { width: 100%; height: 100%; object-fit: contain; }
 
 .endpoints { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 0.82rem; color: var(--muted); }
-.endpoint-row { display: flex; justify-content: space-between; gap: 8px; background: #101620; padding: 6px 10px; border-radius: 6px; }
-.endpoint-row code { color: var(--text); }
+.endpoint-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  background: #101620;
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.endpoint-row code {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.endpoint-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.btn-copy {
+  background: #1e293b;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.btn-copy:hover {
+  background: #273449;
+  border-color: var(--accent);
+}
+.btn-copy.copied {
+  background: rgba(34, 197, 94, 0.18);
+  border-color: var(--ok);
+  color: var(--ok);
+}
 
 .stats-grid {
   display: grid;

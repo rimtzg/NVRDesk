@@ -3,6 +3,69 @@ let privacyMasksState = [];
 let draftMasks = [];
 let selectedMaskIdx = -1;
 let dragOp = null;
+let lastEndpointsKey = "";
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      // Fall through to execCommand fallback
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  return ok;
+}
+
+function renderEndpointsList(container, endpoints) {
+  const key = JSON.stringify(endpoints || []);
+  if (key === lastEndpointsKey) return;
+  lastEndpointsKey = key;
+
+  const frag = document.createDocumentFragment();
+  for (const ep of endpoints || []) {
+    const row = document.createElement("div");
+    row.className = "endpoint-row";
+
+    const labelEl = document.createElement("span");
+    labelEl.textContent = ep.label;
+
+    const valueWrap = document.createElement("div");
+    valueWrap.className = "endpoint-value";
+
+    const codeEl = document.createElement("code");
+    codeEl.textContent = ep.url;
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "btn-copy";
+    copyBtn.dataset.copyUrl = ep.url;
+    copyBtn.textContent = "Copy";
+    copyBtn.title = `Copy ${ep.label} URL`;
+
+    valueWrap.appendChild(codeEl);
+    valueWrap.appendChild(copyBtn);
+    row.appendChild(labelEl);
+    row.appendChild(valueWrap);
+    frag.appendChild(row);
+  }
+  container.replaceChildren(frag);
+}
 
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts);
@@ -139,9 +202,7 @@ async function refreshStatus() {
     }
 
     const endpoints = document.getElementById("endpoints-list");
-    endpoints.innerHTML = st.endpoints
-      .map((ep) => `<div class="endpoint-row"><span>${ep.label}</span><code>${ep.url}</code></div>`)
-      .join("");
+    renderEndpointsList(endpoints, st.endpoints);
 
     const feed = document.getElementById("events-feed");
     const events = st.recent_events || [];
@@ -154,6 +215,23 @@ async function refreshStatus() {
     document.getElementById("status-badge").textContent = "Offline";
   }
 }
+
+document.getElementById("endpoints-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".btn-copy");
+  if (!btn) return;
+  const url = btn.dataset.copyUrl;
+  if (!url) return;
+  const copied = await copyTextToClipboard(url);
+  btn.textContent = copied ? "Copied!" : "Failed";
+  btn.classList.toggle("copied", copied);
+  clearTimeout(Number(btn.dataset.resetTimer || 0));
+  btn.dataset.resetTimer = String(
+    setTimeout(() => {
+      btn.textContent = "Copy";
+      btn.classList.remove("copied");
+    }, 1800),
+  );
+});
 
 document.getElementById("preview-profile").addEventListener("change", (e) => {
   document.getElementById("preview-img").src = `/preview/${e.target.value}.mjpeg?t=${Date.now()}`;
