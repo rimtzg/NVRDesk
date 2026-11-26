@@ -56,6 +56,7 @@ enum CliWebcamMode {
     Pip,
     Channel,
     VirtualOnvif,
+    PipAndVirtualOnvif,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -188,9 +189,21 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     webcam: bool,
 
-    /// Webcam integration mode (`pip`, `channel`, or `virtual-onvif`).
+    /// Webcam integration mode (`pip`, `channel`, `virtual-onvif`, or `pip-and-virtual-onvif`).
     #[arg(long, value_enum)]
     webcam_mode: Option<CliWebcamMode>,
+
+    /// Also expose a standalone Virtual ONVIF camera alongside PiP/Channel mode.
+    #[arg(long, default_value_t = false)]
+    webcam_virtual_onvif: bool,
+
+    /// Enable microphone audio on the Virtual ONVIF / dedicated webcam stream.
+    #[arg(long, default_value_t = false)]
+    webcam_audio: bool,
+
+    /// Optional dedicated microphone device name for the webcam stream.
+    #[arg(long)]
+    webcam_audio_device: Option<String>,
 
     /// Webcam device index.
     #[arg(long)]
@@ -647,7 +660,17 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
             CliWebcamMode::Pip => WebcamMode::Pip,
             CliWebcamMode::Channel => WebcamMode::Channel,
             CliWebcamMode::VirtualOnvif => WebcamMode::VirtualOnvif,
+            CliWebcamMode::PipAndVirtualOnvif => WebcamMode::PipAndVirtualOnvif,
         };
+    }
+    if cli.webcam_virtual_onvif {
+        cfg.webcam.virtual_onvif_enabled = true;
+    }
+    if cli.webcam_audio {
+        cfg.webcam.audio_enabled = true;
+    }
+    if let Some(dev) = &cli.webcam_audio_device {
+        cfg.webcam.audio_device_name = Some(dev.clone());
     }
     if let Some(idx) = cli.webcam_device {
         cfg.webcam.device_index = idx;

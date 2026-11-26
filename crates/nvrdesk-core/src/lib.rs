@@ -337,6 +337,8 @@ pub enum WebcamMode {
     Channel,
     /// Expose webcam as a separate virtual ONVIF/RTSP IP camera with MainStream (`/stream1`) + SubStream (`/stream2`).
     VirtualOnvif,
+    /// Composite webcam as Picture-in-Picture on desktop AND expose it as a separate virtual ONVIF/RTSP camera.
+    PipAndVirtualOnvif,
 }
 
 /// Picture-in-Picture corner placement.
@@ -357,20 +359,51 @@ pub struct WebcamConfig {
     pub enabled: bool,
     pub device_index: usize,
     pub mode: WebcamMode,
+    /// Enables the standalone Virtual ONVIF camera alongside `mode` (e.g. while `mode = "pip"`).
+    pub virtual_onvif_enabled: bool,
     pub pip_position: PipPosition,
     pub pip_scale: f32,
     pub channel_path: String,
     pub max_width: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
-    /// Dedicated ONVIF HTTP/HTTPS listening port when `mode = "virtual_onvif"` (default `8081`).
+    /// Dedicated ONVIF HTTP/HTTPS listening port for the virtual webcam camera (default `8081`).
     pub onvif_http_port: u16,
-    /// Dedicated RTSP listening port when `mode = "virtual_onvif"` (default `8555`).
+    /// Dedicated RTSP listening port for the virtual webcam camera (default `8555`).
     pub rtsp_port: u16,
-    /// Dedicated RTSPS listening port when TLS is enabled and `mode = "virtual_onvif"` (default `8323`).
+    /// Dedicated RTSPS listening port when TLS is enabled for the virtual webcam camera (default `8323`).
     pub rtsps_port: u16,
     /// Optional custom ONVIF device name for the virtual webcam camera.
     pub onvif_device_name: Option<String>,
+    /// Capture microphone audio (`trackID=1`) on the virtual webcam ONVIF/RTSP streams.
+    pub audio_enabled: bool,
+    /// Optional dedicated microphone device name for the virtual webcam (falls back to `audio.device_name` / default).
+    pub audio_device_name: Option<String>,
+}
+
+impl WebcamConfig {
+    /// Returns `true` when the webcam should be composited as Picture-in-Picture onto the desktop stream.
+    #[must_use]
+    pub const fn uses_pip(&self) -> bool {
+        self.enabled && matches!(self.mode, WebcamMode::Pip | WebcamMode::PipAndVirtualOnvif)
+    }
+
+    /// Returns `true` when the webcam should also mount `/webcam` on the primary RTSP/ONVIF server.
+    #[must_use]
+    pub const fn uses_channel(&self) -> bool {
+        self.enabled && matches!(self.mode, WebcamMode::Channel)
+    }
+
+    /// Returns `true` when the standalone Virtual ONVIF/RTSP webcam camera should be active.
+    #[must_use]
+    pub const fn uses_virtual_onvif(&self) -> bool {
+        self.enabled
+            && (self.virtual_onvif_enabled
+                || matches!(
+                    self.mode,
+                    WebcamMode::VirtualOnvif | WebcamMode::PipAndVirtualOnvif
+                ))
+    }
 }
 
 impl Default for WebcamConfig {
@@ -379,6 +412,7 @@ impl Default for WebcamConfig {
             enabled: false,
             device_index: 0,
             mode: WebcamMode::Pip,
+            virtual_onvif_enabled: false,
             pip_position: PipPosition::TopRight,
             pip_scale: 0.22,
             channel_path: "/webcam".to_string(),
@@ -389,6 +423,8 @@ impl Default for WebcamConfig {
             rtsp_port: 8555,
             rtsps_port: 8323,
             onvif_device_name: None,
+            audio_enabled: false,
+            audio_device_name: None,
         }
     }
 }

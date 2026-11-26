@@ -91,11 +91,11 @@ function populateSelect(el, items, selectedIdx, defaultLabel) {
   }
 }
 
-function populateMicSelect(el, items, selectedName) {
+function populateMicSelect(el, items, selectedName, defaultLabel = "System Default Microphone") {
   el.innerHTML = "";
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = "System Default Microphone";
+  def.textContent = defaultLabel;
   el.appendChild(def);
   for (const item of items || []) {
     const opt = document.createElement("option");
@@ -129,6 +129,12 @@ async function loadInitial() {
   populateSelect(document.getElementById("cfg-display"), devices.monitors, cfg.source.display, "Primary Display");
   populateSelect(document.getElementById("cfg-webcam-device"), devices.webcams, cfg.webcam.device_index, "No Webcam Found");
   populateMicSelect(document.getElementById("cfg-audio-device"), devices.microphones, cfg.audio.device_name);
+  populateMicSelect(
+    document.getElementById("cfg-webcam-audio-device"),
+    devices.microphones,
+    cfg.webcam.audio_device_name,
+    "Same as Main / Default Microphone",
+  );
 
   document.getElementById("cfg-encoder-backend").value = cfg.encoder.backend;
   document.getElementById("cfg-main-codec").value = cfg.main_stream.codec || "h264";
@@ -140,9 +146,11 @@ async function loadInitial() {
 
   document.getElementById("cfg-webcam-enabled").checked = cfg.webcam.enabled;
   document.getElementById("cfg-webcam-mode").value = cfg.webcam.mode;
+  document.getElementById("cfg-webcam-virtual-onvif").checked = Boolean(cfg.webcam.virtual_onvif_enabled);
   document.getElementById("cfg-pip-pos").value = cfg.webcam.pip_position;
   document.getElementById("cfg-webcam-onvif-port").value = cfg.webcam.onvif_http_port || 8081;
   document.getElementById("cfg-webcam-rtsp-port").value = cfg.webcam.rtsp_port || 8555;
+  document.getElementById("cfg-webcam-audio-enabled").checked = Boolean(cfg.webcam.audio_enabled);
 
   document.getElementById("cfg-audio-enabled").checked = cfg.audio.enabled;
   document.getElementById("cfg-audio-codec").value = cfg.audio.codec;
@@ -261,9 +269,13 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   updated.webcam.enabled = document.getElementById("cfg-webcam-enabled").checked;
   updated.webcam.device_index = Number(document.getElementById("cfg-webcam-device").value) || 0;
   updated.webcam.mode = document.getElementById("cfg-webcam-mode").value;
+  updated.webcam.virtual_onvif_enabled = document.getElementById("cfg-webcam-virtual-onvif").checked;
   updated.webcam.pip_position = document.getElementById("cfg-pip-pos").value;
   updated.webcam.onvif_http_port = Number(document.getElementById("cfg-webcam-onvif-port").value) || 8081;
   updated.webcam.rtsp_port = Number(document.getElementById("cfg-webcam-rtsp-port").value) || 8555;
+  updated.webcam.audio_enabled = document.getElementById("cfg-webcam-audio-enabled").checked;
+  const webcamMicVal = document.getElementById("cfg-webcam-audio-device").value;
+  updated.webcam.audio_device_name = webcamMicVal ? webcamMicVal : null;
 
   updated.audio.enabled = document.getElementById("cfg-audio-enabled").checked;
   const micVal = document.getElementById("cfg-audio-device").value;

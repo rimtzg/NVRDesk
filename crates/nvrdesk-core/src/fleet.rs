@@ -338,7 +338,7 @@ pub fn validate_config(cfg: &NvrDeskConfig) -> ValidationReport {
     if cfg.tls.rtsps_enabled && cfg.tls.rtsps_port > 0 && cfg.tls.rtsps_port == cfg.rtsp.port {
         errors.push("port conflict: tls.rtsps_port equals rtsp.port".into());
     }
-    if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::VirtualOnvif {
+    if cfg.webcam.uses_virtual_onvif() {
         let cam_http = cfg.webcam.onvif_http_port;
         let cam_rtsp = cfg.webcam.rtsp_port;
         if cam_rtsp > 0 && (cam_rtsp == cfg.rtsp.port || cam_rtsp == cfg.onvif.http_port) {

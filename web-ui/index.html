@@ -209,11 +209,19 @@
               Webcam Mode
               <select id="cfg-webcam-mode">
                 <option value="pip">Picture-in-Picture</option>
+                <option value="pip_and_virtual_onvif">PiP + Separate Virtual ONVIF Camera</option>
                 <option value="virtual_onvif">Separate Virtual ONVIF Camera (Main + Sub)</option>
                 <option value="channel">Dedicated RTSP Channel (/webcam)</option>
               </select>
               <span class="field-hint">PiP composites on desktop; Separate Virtual ONVIF exposes a 2nd camera with /stream1 + /stream2 (recommended for Dahua NVRs).</span>
             </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-webcam-virtual-onvif" type="checkbox" />
+                Also Expose Virtual ONVIF Camera
+              </label>
+              <span class="field-hint">Runs the standalone 2nd ONVIF camera (/stream1 + /stream2) alongside PiP mode at the same time.</span>
+            </div>
             <label>
               PiP Corner
               <select id="cfg-pip-pos">
@@ -222,17 +230,29 @@
                 <option value="bottom_right">Bottom Right</option>
                 <option value="bottom_left">Bottom Left</option>
               </select>
-              <span class="field-hint">Screen corner where the webcam overlay is placed when Webcam Mode is PiP.</span>
+              <span class="field-hint">Screen corner where the webcam overlay is placed when Webcam Mode uses PiP.</span>
             </label>
             <label>
               Webcam ONVIF Port
               <input id="cfg-webcam-onvif-port" type="number" min="1" max="65535" value="8081" />
-              <span class="field-hint">Dedicated ONVIF Device HTTP(S) port when using Separate Virtual ONVIF Camera mode.</span>
+              <span class="field-hint">Dedicated ONVIF Device HTTP(S) port for the standalone Virtual ONVIF Webcam.</span>
             </label>
             <label>
               Webcam RTSP Port
               <input id="cfg-webcam-rtsp-port" type="number" min="1" max="65535" value="8555" />
               <span class="field-hint">Dedicated RTSP port serving /stream1 (Main) and /stream2 (Sub) for the virtual webcam.</span>
+            </label>
+            <div class="checkbox-field">
+              <label class="checkbox-row">
+                <input id="cfg-webcam-audio-enabled" type="checkbox" />
+                Enable Virtual Webcam Audio
+              </label>
+              <span class="field-hint">Captures G.711 microphone audio on the Virtual ONVIF / dedicated webcam stream.</span>
+            </div>
+            <label>
+              Webcam Microphone Device
+              <select id="cfg-webcam-audio-device"></select>
+              <span class="field-hint">Optional dedicated microphone for the webcam ONVIF camera (leave default to share main/default mic).</span>
             </label>
             <div class="checkbox-field">
               <label class="checkbox-row">

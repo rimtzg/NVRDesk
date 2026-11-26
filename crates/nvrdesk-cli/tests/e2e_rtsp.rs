@@ -1032,14 +1032,18 @@ async fn virtual_onvif_webcam_exposes_independent_main_and_sub_profiles() {
     cfg.daemon.tray_enabled = false;
     cfg.input_overlay.enabled = false;
     cfg.webcam.enabled = true;
-    cfg.webcam.mode = WebcamMode::VirtualOnvif;
+    cfg.webcam.mode = WebcamMode::Pip;
+    cfg.webcam.virtual_onvif_enabled = true;
+    cfg.webcam.audio_enabled = true;
     cfg.webcam.onvif_http_port = 0;
     cfg.webcam.rtsp_port = 0;
+    assert!(cfg.webcam.uses_pip());
+    assert!(cfg.webcam.uses_virtual_onvif());
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let (handle, worker) = start_daemon(cfg, None, Arc::clone(&shutdown))
         .await
-        .expect("start_daemon virtual_onvif");
+        .expect("start_daemon pip + virtual_onvif");
 
     let cam_http = handle
         .virtual_webcam_http_port()
@@ -1066,6 +1070,7 @@ async fn virtual_onvif_webcam_exposes_independent_main_and_sub_profiles() {
     );
     assert!(profiles_resp.contains("token=\"MainProfile\""));
     assert!(profiles_resp.contains("token=\"SubProfile\""));
+    assert!(profiles_resp.contains("AudioEncoderConfiguration"));
     assert!(!profiles_resp.contains("WebcamProfile"));
 
     let main_uri_soap = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetStreamUri><trt:ProfileToken>MainProfile</trt:ProfileToken></trt:GetStreamUri></s:Body></s:Envelope>"#;
@@ -1083,7 +1088,8 @@ async fn virtual_onvif_webcam_exposes_independent_main_and_sub_profiles() {
         "{sub_uri_resp}"
     );
 
-    // Primary Web UI /status advertises the standalone Virtual ONVIF Webcam endpoints.
+    // Primary Web UI /status advertises the standalone Virtual ONVIF Webcam endpoints,
+    // while desktop ONVIF profiles remain audio-free when only webcam audio is enabled.
     let web_url = handle.web_ui_url();
     let http_port: u16 = web_url
         .trim_end_matches('/')
@@ -1093,14 +1099,28 @@ async fn virtual_onvif_webcam_exposes_independent_main_and_sub_profiles() {
         .parse()
         .unwrap();
     let main_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port);
+    let desktop_profiles = send_http(
+        main_addr,
+        "POST",
+        "/onvif/media_service",
+        &[],
+        get_profiles_soap,
+    )
+    .await;
+    assert!(!desktop_profiles.contains("AudioEncoderConfiguration"));
+
     let status_resp = send_http(main_addr, "GET", "/api/v1/status", &[], "").await;
     assert!(status_resp.contains("Webcam ONVIF Device Service"));
     assert!(status_resp.contains(&format!(":{cam_rtsp}/stream1")));
 
-    // Hot-switching back to PiP mode tears down the standalone ONVIF/RTSP servers cleanly.
+    // Hot-disabling virtual_onvif_enabled tears down the standalone ONVIF/RTSP servers cleanly.
     let cfg_resp = send_http(main_addr, "GET", "/api/v1/config", &[], "").await;
     let cfg_body = cfg_resp.split("\r\n\r\n").nth(1).expect("cfg body");
-    let updated_cfg = cfg_body.replacen("\"mode\":\"virtual_onvif\"", "\"mode\":\"pip\"", 1);
+    let updated_cfg = cfg_body.replacen(
+        "\"virtual_onvif_enabled\":true",
+        "\"virtual_onvif_enabled\":false",
+        1,
+    );
     let put_resp = send_http(
         main_addr,
         "PUT",

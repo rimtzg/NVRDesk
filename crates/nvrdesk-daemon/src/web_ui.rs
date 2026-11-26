@@ -25,7 +25,7 @@ use futures_core::Stream;
 use nvrdesk_capture::enumerate_devices;
 use nvrdesk_core::{
     FleetOverrides, NvrDeskConfig, PosOsdLevel, PosOsdLine, SrtConfig, ValidationReport,
-    WebcamMode, build_template_config, list_fleet_templates, validate_config,
+    build_template_config, list_fleet_templates, validate_config,
 };
 use nvrdesk_onvif::{EventBroker, OnvifEventRecord, SnapshotProvider};
 use nvrdesk_rtsp::{RtspStreamHandle, SrtStats, normalize_stream_path};
@@ -161,14 +161,13 @@ pub fn build_endpoints_with_virtual(
             url: format!("rtsp://{display_ip}:{rtsp_port}{sub_path}"),
         });
     }
-    if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+    if cfg.webcam.uses_channel() {
         endpoints.push(EndpointInfo {
             label: "Webcam RTSP".into(),
             url: format!("rtsp://{display_ip}:{rtsp_port}{webcam_path}"),
         });
     }
-    if cfg.webcam.enabled
-        && cfg.webcam.mode == WebcamMode::VirtualOnvif
+    if cfg.webcam.uses_virtual_onvif()
         && let Some(vw) = virtual_webcam
     {
         endpoints.push(EndpointInfo {

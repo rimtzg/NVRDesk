@@ -384,8 +384,33 @@ fn encoding_str(codec: VideoCodecKind) -> &'static str {
     }
 }
 
-fn render_profile_xml(tag: &str, p: &OnvifMediaProfile, src_w: u32, src_h: u32) -> String {
+fn render_profile_xml(
+    tag: &str,
+    p: &OnvifMediaProfile,
+    src_w: u32,
+    src_h: u32,
+    audio_enabled: bool,
+) -> String {
     let enc = encoding_str(p.encoding);
+    let audio_xml = if audio_enabled {
+        r#"
+      <tt:AudioSourceConfiguration token="AudioSourceConfig_1">
+        <tt:Name>Microphone</tt:Name>
+        <tt:UseCount>2</tt:UseCount>
+        <tt:SourceToken>AudioSource_1</tt:SourceToken>
+      </tt:AudioSourceConfiguration>
+      <tt:AudioEncoderConfiguration token="AudioEncoderConfig_1">
+        <tt:Name>G711</tt:Name>
+        <tt:UseCount>2</tt:UseCount>
+        <tt:Encoding>G711</tt:Encoding>
+        <tt:Bitrate>64</tt:Bitrate>
+        <tt:SampleRate>8</tt:SampleRate>
+        <tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address><tt:Port>0</tt:Port><tt:TTL>1</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>
+        <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+      </tt:AudioEncoderConfiguration>"#
+    } else {
+        ""
+    };
     format!(
         r#"<{tag} token="{token}" fixed="true">
       <tt:Name>{name}</tt:Name>
@@ -412,7 +437,7 @@ fn render_profile_xml(tag: &str, p: &OnvifMediaProfile, src_w: u32, src_h: u32) 
         </tt:H264>
         <tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address><tt:Port>0</tt:Port><tt:TTL>1</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>
         <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-      </tt:VideoEncoderConfiguration>
+      </tt:VideoEncoderConfiguration>{audio_xml}
     </{tag}>"#,
         token = escape_xml(&p.token),
         name = escape_xml(&p.name),
@@ -427,12 +452,26 @@ fn render_profile_xml(tag: &str, p: &OnvifMediaProfile, src_w: u32, src_h: u32) 
 
 #[must_use]
 pub fn get_profiles_response(profiles: &[OnvifMediaProfile]) -> String {
+    get_profiles_response_with_audio(profiles, false)
+}
+
+#[must_use]
+pub fn get_profiles_response_with_audio(
+    profiles: &[OnvifMediaProfile],
+    audio_enabled: bool,
+) -> String {
     let (src_w, src_h) = profiles
         .first()
         .map_or((1920, 1080), |p| (p.width, p.height));
     let mut inner = String::new();
     for p in profiles {
-        inner.push_str(&render_profile_xml("trt:Profiles", p, src_w, src_h));
+        inner.push_str(&render_profile_xml(
+            "trt:Profiles",
+            p,
+            src_w,
+            src_h,
+            audio_enabled,
+        ));
     }
     soap_envelope(&format!(
         "<trt:GetProfilesResponse>{inner}</trt:GetProfilesResponse>"
@@ -441,7 +480,17 @@ pub fn get_profiles_response(profiles: &[OnvifMediaProfile]) -> String {
 
 #[must_use]
 pub fn get_profile_response(profile: &OnvifMediaProfile, src_w: u32, src_h: u32) -> String {
-    let xml = render_profile_xml("trt:Profile", profile, src_w, src_h);
+    get_profile_response_with_audio(profile, src_w, src_h, false)
+}
+
+#[must_use]
+pub fn get_profile_response_with_audio(
+    profile: &OnvifMediaProfile,
+    src_w: u32,
+    src_h: u32,
+    audio_enabled: bool,
+) -> String {
+    let xml = render_profile_xml("trt:Profile", profile, src_w, src_h, audio_enabled);
     soap_envelope(&format!(
         "<trt:GetProfileResponse>{xml}</trt:GetProfileResponse>"
     ))
