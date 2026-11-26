@@ -3,6 +3,8 @@
 pub mod audio;
 pub mod ffmpeg_source;
 pub mod webcam;
+#[cfg(any(target_os = "linux", test))]
+mod x11_capture;
 
 use std::sync::{
     Arc,
@@ -87,10 +89,12 @@ pub trait CaptureSource: Send {
     fn stop(&mut self);
 }
 
-/// Cross-platform screen capture source backed by `xcap`.
+/// Cross-platform screen capture source backed by `xcap` (with clamped X11 capture on Linux).
 pub struct ScreenCaptureSource {
     name: String,
     display_index: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fps: u32,
     bounds: Option<MonitorBounds>,
     running: Arc<AtomicBool>,
     rx: Option<mpsc::Receiver<Result<RawVideoFrame, NvrDeskError>>>,
@@ -100,10 +104,11 @@ pub struct ScreenCaptureSource {
 impl ScreenCaptureSource {
     /// Creates a new screen capture source for `display_index` (0 = primary or first monitor).
     #[must_use]
-    pub fn new(display_index: usize, _fps: u32, _show_cursor: bool) -> Self {
+    pub fn new(display_index: usize, fps: u32, _show_cursor: bool) -> Self {
         Self {
             name: format!("screen:{display_index}"),
             display_index,
+            fps: fps.max(1),
             bounds: None,
             running: Arc::new(AtomicBool::new(false)),
             rx: None,
@@ -153,6 +158,11 @@ fn monitor_bounds(monitor: &Monitor) -> Option<MonitorBounds> {
 pub fn capture_single_screen_frame(
     display_index: usize,
 ) -> Result<(RawVideoFrame, Option<MonitorBounds>), NvrDeskError> {
+    #[cfg(target_os = "linux")]
+    if !x11_capture::is_wayland_session() {
+        return x11_capture::capture_single_frame(display_index);
+    }
+
     let monitor = select_monitor(display_index)?;
     let bounds = monitor_bounds(&monitor);
     let image = monitor
@@ -170,6 +180,111 @@ pub fn capture_single_screen_frame(
         data: image.into_raw(),
     };
     Ok((frame, bounds))
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_x11_worker(
+    display_index: usize,
+    fps: u32,
+    tx: SyncSender<Result<RawVideoFrame, NvrDeskError>>,
+    init_tx: SyncSender<Result<Option<MonitorBounds>, NvrDeskError>>,
+    running: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, NvrDeskError> {
+    thread::Builder::new()
+        .name("nvrdesk-x11-capture".into())
+        .spawn(move || {
+            let mut capturer = match x11_capture::X11Capturer::open(display_index) {
+                Ok(c) => c,
+                Err(err) => {
+                    let _ = init_tx.send(Err(err));
+                    return;
+                }
+            };
+            let start_time = Instant::now();
+            let first_frame = match capturer.capture_frame(0) {
+                Ok(f) => f,
+                Err(err) => {
+                    let _ = init_tx.send(Err(err));
+                    return;
+                }
+            };
+            let bounds = Some(capturer.bounds());
+            debug!(?bounds, fps, "clamped X11 screen capture started");
+            let _ = init_tx.send(Ok(bounds));
+
+            if let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Ok(first_frame)) {
+                return;
+            }
+
+            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+            while running.load(Ordering::Acquire) {
+                let tick_start = Instant::now();
+                let ts_us = start_time.elapsed().as_micros() as u64;
+                match capturer.capture_frame(ts_us) {
+                    Ok(frame) => {
+                        if let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Ok(frame)) {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.try_send(Err(err));
+                        break;
+                    }
+                }
+                let elapsed = tick_start.elapsed();
+                if elapsed < frame_interval {
+                    thread::sleep(frame_interval - elapsed);
+                }
+            }
+            debug!("X11 capture loop exited");
+        })
+        .map_err(|e| NvrDeskError::Capture(format!("failed to spawn capture thread: {e}")))
+}
+
+fn spawn_xcap_worker(
+    display_index: usize,
+    tx: SyncSender<Result<RawVideoFrame, NvrDeskError>>,
+    init_tx: SyncSender<Result<Option<MonitorBounds>, NvrDeskError>>,
+    running: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, NvrDeskError> {
+    thread::Builder::new()
+        .name("nvrdesk-xcap-capture".into())
+        .spawn(move || {
+            // Keep Monitor/VideoRecorder on this thread since OS capture handles may be !Send.
+            let monitor = match select_monitor(display_index) {
+                Ok(m) => m,
+                Err(err) => {
+                    let _ = init_tx.send(Err(err));
+                    return;
+                }
+            };
+            let monitor_name = monitor
+                .name()
+                .unwrap_or_else(|_| format!("screen:{display_index}"));
+            let bounds = monitor_bounds(&monitor);
+            let (recorder, raw_rx) = match monitor.video_recorder() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = init_tx.send(Err(map_xcap_error(&err.to_string())));
+                    return;
+                }
+            };
+            if let Err(err) = recorder.start() {
+                let _ = init_tx.send(Err(map_xcap_error(&err.to_string())));
+                return;
+            }
+
+            debug!(monitor = %monitor_name, ?bounds, "screen capture started");
+            let _ = init_tx.send(Ok(bounds));
+
+            let start_time = Instant::now();
+            capture_loop(raw_rx, &tx, &running, start_time);
+
+            if let Err(err) = recorder.stop() {
+                warn!(error = %err, "failed to stop screen recorder cleanly");
+            }
+        })
+        .map_err(|e| NvrDeskError::Capture(format!("failed to spawn capture thread: {e}")))
 }
 
 impl CaptureSource for ScreenCaptureSource {
@@ -193,44 +308,14 @@ impl CaptureSource for ScreenCaptureSource {
         running.store(true, Ordering::Release);
         let display_index = self.display_index;
 
-        let worker = thread::Builder::new()
-            .name("nvrdesk-xcap-capture".into())
-            .spawn(move || {
-                // Keep Monitor/VideoRecorder on this thread since OS capture handles may be !Send.
-                let monitor = match select_monitor(display_index) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        let _ = init_tx.send(Err(err));
-                        return;
-                    }
-                };
-                let monitor_name = monitor
-                    .name()
-                    .unwrap_or_else(|_| format!("screen:{display_index}"));
-                let bounds = monitor_bounds(&monitor);
-                let (recorder, raw_rx) = match monitor.video_recorder() {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        let _ = init_tx.send(Err(map_xcap_error(&err.to_string())));
-                        return;
-                    }
-                };
-                if let Err(err) = recorder.start() {
-                    let _ = init_tx.send(Err(map_xcap_error(&err.to_string())));
-                    return;
-                }
-
-                debug!(monitor = %monitor_name, ?bounds, "screen capture started");
-                let _ = init_tx.send(Ok(bounds));
-
-                let start_time = Instant::now();
-                capture_loop(raw_rx, &tx, &running, start_time);
-
-                if let Err(err) = recorder.stop() {
-                    warn!(error = %err, "failed to stop screen recorder cleanly");
-                }
-            })
-            .map_err(|e| NvrDeskError::Capture(format!("failed to spawn capture thread: {e}")))?;
+        #[cfg(target_os = "linux")]
+        let worker = if !x11_capture::is_wayland_session() {
+            spawn_x11_worker(display_index, self.fps, tx, init_tx, running)?
+        } else {
+            spawn_xcap_worker(display_index, tx, init_tx, running)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let worker = spawn_xcap_worker(display_index, tx, init_tx, running)?;
 
         match init_rx.recv() {
             Ok(Ok(bounds)) => {

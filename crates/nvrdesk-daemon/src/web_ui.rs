@@ -32,6 +32,7 @@ use nvrdesk_rtsp::{RtspStreamHandle, SrtStats, normalize_stream_path};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
+use tracing::warn;
 
 use crate::{pos_osd::PosOsdStore, recorder::RecordingStats};
 
@@ -499,14 +500,32 @@ async fn serve_mjpeg_preview(
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut last_err_log: Option<Instant> = None;
         loop {
             interval.tick().await;
             let snaps = Arc::clone(&snapshots);
             let prof = profile.clone();
             let res = tokio::task::spawn_blocking(move || snaps.capture_jpeg(&prof)).await;
-            let Ok(Ok(jpeg)) = res else {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                continue;
+            let jpeg = match res {
+                Ok(Ok(jpeg)) => {
+                    last_err_log = None;
+                    jpeg
+                }
+                Ok(Err(err)) => {
+                    let should_log =
+                        last_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+                    if should_log {
+                        warn!(profile = %profile, error = %err, "MJPEG preview snapshot failed");
+                        last_err_log = Some(Instant::now());
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(profile = %profile, error = %err, "MJPEG preview task panicked");
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
             };
             let header_part = format!(
                 "--nvrdeskframe\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
