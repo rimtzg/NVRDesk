@@ -1016,3 +1016,103 @@ async fn phase4_fleet_templates_validation_and_manifest_end_to_end() {
     shutdown.store(true, Ordering::Release);
     let _ = worker.join();
 }
+
+#[tokio::test]
+async fn virtual_onvif_webcam_exposes_independent_main_and_sub_profiles() {
+    use nvrdesk_core::{CaptureSourceKind, EncoderBackendKind, NvrDeskConfig, WebcamMode};
+    use nvrdesk_daemon::start_daemon;
+
+    let mut cfg = NvrDeskConfig::default();
+    cfg.source.kind = CaptureSourceKind::TestPattern;
+    cfg.encoder.backend = EncoderBackendKind::Openh264;
+    cfg.rtsp.bind = "127.0.0.1".to_string();
+    cfg.rtsp.port = 0;
+    cfg.onvif.http_port = 0;
+    cfg.onvif.discovery_enabled = false;
+    cfg.daemon.tray_enabled = false;
+    cfg.input_overlay.enabled = false;
+    cfg.webcam.enabled = true;
+    cfg.webcam.mode = WebcamMode::VirtualOnvif;
+    cfg.webcam.onvif_http_port = 0;
+    cfg.webcam.rtsp_port = 0;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (handle, worker) = start_daemon(cfg, None, Arc::clone(&shutdown))
+        .await
+        .expect("start_daemon virtual_onvif");
+
+    let cam_http = handle
+        .virtual_webcam_http_port()
+        .expect("virtual webcam ONVIF HTTP port");
+    let cam_rtsp = handle
+        .virtual_webcam_rtsp_port()
+        .expect("virtual webcam RTSP port");
+    assert_ne!(cam_rtsp, handle.rtsp_port());
+
+    let cam_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cam_http);
+
+    let get_profiles_soap = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetProfiles/></s:Body></s:Envelope>"#;
+    let profiles_resp = send_http(
+        cam_addr,
+        "POST",
+        "/onvif/media_service",
+        &[],
+        get_profiles_soap,
+    )
+    .await;
+    assert!(
+        profiles_resp.starts_with("HTTP/1.1 200 OK"),
+        "{profiles_resp}"
+    );
+    assert!(profiles_resp.contains("token=\"MainProfile\""));
+    assert!(profiles_resp.contains("token=\"SubProfile\""));
+    assert!(!profiles_resp.contains("WebcamProfile"));
+
+    let main_uri_soap = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetStreamUri><trt:ProfileToken>MainProfile</trt:ProfileToken></trt:GetStreamUri></s:Body></s:Envelope>"#;
+    let main_uri_resp =
+        send_http(cam_addr, "POST", "/onvif/media_service", &[], main_uri_soap).await;
+    assert!(
+        main_uri_resp.contains(&format!("rtsp://127.0.0.1:{cam_rtsp}/stream1")),
+        "{main_uri_resp}"
+    );
+
+    let sub_uri_soap = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetStreamUri><trt:ProfileToken>SubProfile</trt:ProfileToken></trt:GetStreamUri></s:Body></s:Envelope>"#;
+    let sub_uri_resp = send_http(cam_addr, "POST", "/onvif/media_service", &[], sub_uri_soap).await;
+    assert!(
+        sub_uri_resp.contains(&format!("rtsp://127.0.0.1:{cam_rtsp}/stream2")),
+        "{sub_uri_resp}"
+    );
+
+    // Primary Web UI /status advertises the standalone Virtual ONVIF Webcam endpoints.
+    let web_url = handle.web_ui_url();
+    let http_port: u16 = web_url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let main_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port);
+    let status_resp = send_http(main_addr, "GET", "/api/v1/status", &[], "").await;
+    assert!(status_resp.contains("Webcam ONVIF Device Service"));
+    assert!(status_resp.contains(&format!(":{cam_rtsp}/stream1")));
+
+    // Hot-switching back to PiP mode tears down the standalone ONVIF/RTSP servers cleanly.
+    let cfg_resp = send_http(main_addr, "GET", "/api/v1/config", &[], "").await;
+    let cfg_body = cfg_resp.split("\r\n\r\n").nth(1).expect("cfg body");
+    let updated_cfg = cfg_body.replacen("\"mode\":\"virtual_onvif\"", "\"mode\":\"pip\"", 1);
+    let put_resp = send_http(
+        main_addr,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        &updated_cfg,
+    )
+    .await;
+    assert!(put_resp.starts_with("HTTP/1.1 200 OK"), "{put_resp}");
+    assert!(handle.virtual_webcam_http_port().is_none());
+    assert!(handle.virtual_webcam_rtsp_port().is_none());
+
+    shutdown.store(true, Ordering::Release);
+    let _ = worker.join();
+}

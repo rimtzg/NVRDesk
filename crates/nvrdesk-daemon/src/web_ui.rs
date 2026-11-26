@@ -31,7 +31,7 @@ use nvrdesk_onvif::{EventBroker, OnvifEventRecord, SnapshotProvider};
 use nvrdesk_rtsp::{RtspStreamHandle, SrtStats, normalize_stream_path};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
 
 use crate::{pos_osd::PosOsdStore, recorder::RecordingStats};
@@ -66,6 +66,18 @@ pub struct DaemonStatus {
     pub recent_events: Vec<OnvifEventRecord>,
 }
 
+/// Actual listening ports of the standalone Virtual ONVIF Webcam server, when active.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VirtualWebcamPorts {
+    pub rtsp_port: u16,
+    pub rtsps_port: Option<u16>,
+    pub http_port: Option<u16>,
+}
+
+/// Live-reload command channel notifying the daemon's Virtual ONVIF Webcam supervisor.
+pub type VirtualWebcamReconcileTx =
+    mpsc::UnboundedSender<(NvrDeskConfig, Option<oneshot::Sender<()>>)>;
+
 /// Shared runtime state backing the Web UI, REST API, and worker coordination.
 #[derive(Clone)]
 pub struct DaemonSharedState {
@@ -82,6 +94,8 @@ pub struct DaemonSharedState {
     pub srt_stream_tx: watch::Sender<Option<RtspStreamHandle>>,
     pub main_handle: RtspStreamHandle,
     pub sub_handle_slot: Arc<RwLock<Option<RtspStreamHandle>>>,
+    pub virtual_webcam_ports: Arc<RwLock<Option<VirtualWebcamPorts>>>,
+    pub virtual_webcam_tx: VirtualWebcamReconcileTx,
     pub active_players_fn: Arc<dyn Fn() -> usize + Send + Sync>,
     pub display_ip: String,
     pub rtsp_port: u16,
@@ -103,6 +117,28 @@ pub fn build_endpoints(
     rtsps_port: Option<u16>,
     http_port: u16,
     https_enabled: bool,
+) -> Vec<EndpointInfo> {
+    build_endpoints_with_virtual(
+        cfg,
+        display_ip,
+        rtsp_port,
+        rtsps_port,
+        http_port,
+        https_enabled,
+        None,
+    )
+}
+
+/// Builds advertised endpoints, including a standalone Virtual ONVIF Webcam server when active.
+#[must_use]
+pub fn build_endpoints_with_virtual(
+    cfg: &NvrDeskConfig,
+    display_ip: &str,
+    rtsp_port: u16,
+    rtsps_port: Option<u16>,
+    http_port: u16,
+    https_enabled: bool,
+    virtual_webcam: Option<&VirtualWebcamPorts>,
 ) -> Vec<EndpointInfo> {
     let main_path = normalize_stream_path(&cfg.main_stream.path);
     let sub_path = normalize_stream_path(&cfg.sub_stream.path);
@@ -130,6 +166,39 @@ pub fn build_endpoints(
             label: "Webcam RTSP".into(),
             url: format!("rtsp://{display_ip}:{rtsp_port}{webcam_path}"),
         });
+    }
+    if cfg.webcam.enabled
+        && cfg.webcam.mode == WebcamMode::VirtualOnvif
+        && let Some(vw) = virtual_webcam
+    {
+        endpoints.push(EndpointInfo {
+            label: "Webcam ONVIF MainStream RTSP".into(),
+            url: format!("rtsp://{display_ip}:{}/stream1", vw.rtsp_port),
+        });
+        endpoints.push(EndpointInfo {
+            label: "Webcam ONVIF SubStream RTSP".into(),
+            url: format!("rtsp://{display_ip}:{}/stream2", vw.rtsp_port),
+        });
+        if let Some(cam_tls) = vw.rtsps_port {
+            endpoints.push(EndpointInfo {
+                label: "Webcam ONVIF MainStream RTSPS (TLS)".into(),
+                url: format!("rtsps://{display_ip}:{cam_tls}/stream1"),
+            });
+        }
+        if let Some(cam_http) = vw.http_port {
+            endpoints.push(EndpointInfo {
+                label: "Webcam ONVIF Device Service".into(),
+                url: format!("{http_scheme}://{display_ip}:{cam_http}/onvif/device_service"),
+            });
+            endpoints.push(EndpointInfo {
+                label: "Webcam ONVIF Media2 (Profile T)".into(),
+                url: format!("{http_scheme}://{display_ip}:{cam_http}/onvif/media2_service"),
+            });
+            endpoints.push(EndpointInfo {
+                label: "Webcam ONVIF Snapshot".into(),
+                url: format!("{http_scheme}://{display_ip}:{cam_http}/snapshot/main"),
+            });
+        }
     }
     if cfg.srt.enabled
         && let Some(target) = &cfg.srt.target
@@ -235,13 +304,18 @@ async fn get_status(State(state): State<DaemonSharedState>) -> Json<DaemonStatus
         backchannel_packets: state.backchannel_packets.load(Ordering::Relaxed),
         recording: state.recording_stats.read().expect("rec lock").clone(),
         srt: state.srt_stats.read().expect("srt stats lock").clone(),
-        endpoints: build_endpoints(
+        endpoints: build_endpoints_with_virtual(
             &cfg,
             &state.display_ip,
             state.rtsp_port,
             state.rtsps_port,
             state.http_port,
             state.https_enabled,
+            state
+                .virtual_webcam_ports
+                .read()
+                .expect("virtual webcam ports lock")
+                .as_ref(),
         ),
         active_osd_lines: state.pos_osd.active_lines(Instant::now()),
         recent_events: state.events.recent(10),
@@ -360,7 +434,7 @@ async fn get_config(State(state): State<DaemonSharedState>) -> Json<NvrDeskConfi
     Json(cfg)
 }
 
-fn apply_live_config(state: &DaemonSharedState, new_cfg: NvrDeskConfig) -> Response {
+async fn apply_live_config(state: &DaemonSharedState, new_cfg: NvrDeskConfig) -> Response {
     let report = validate_config(&new_cfg);
     if !report.valid {
         return (StatusCode::BAD_REQUEST, Json(report)).into_response();
@@ -371,6 +445,16 @@ fn apply_live_config(state: &DaemonSharedState, new_cfg: NvrDeskConfig) -> Respo
         return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
     *state.config.write().expect("config lock") = new_cfg.clone();
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if state
+        .virtual_webcam_tx
+        .send((new_cfg.clone(), Some(ack_tx)))
+        .is_ok()
+    {
+        let _ = ack_rx.await;
+    }
+
     let _ = state.srt_cfg_tx.send(new_cfg.srt.clone());
     let srt_target_stream = select_srt_handle(
         &new_cfg.srt.source_stream,
@@ -399,7 +483,7 @@ async fn put_config(
     State(state): State<DaemonSharedState>,
     Json(new_cfg): Json<NvrDeskConfig>,
 ) -> Response {
-    apply_live_config(&state, new_cfg)
+    apply_live_config(&state, new_cfg).await
 }
 
 async fn post_validate_config(Json(cfg): Json<NvrDeskConfig>) -> Json<ValidationReport> {
@@ -422,7 +506,7 @@ async fn post_apply_template(
     Json(req): Json<ApplyTemplateRequest>,
 ) -> Response {
     match build_template_config(&req.template, &req.overrides) {
-        Ok(cfg) => apply_live_config(&state, cfg),
+        Ok(cfg) => apply_live_config(&state, cfg).await,
         Err(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     }
 }
@@ -442,13 +526,18 @@ struct FleetManifest {
 
 async fn get_fleet_manifest(State(state): State<DaemonSharedState>) -> Json<FleetManifest> {
     let cfg = state.config.read().expect("config lock").clone();
-    let endpoints = build_endpoints(
+    let endpoints = build_endpoints_with_virtual(
         &cfg,
         &state.display_ip,
         state.rtsp_port,
         state.rtsps_port,
         state.http_port,
         state.https_enabled,
+        state
+            .virtual_webcam_ports
+            .read()
+            .expect("virtual webcam ports lock")
+            .as_ref(),
     );
     let validation = validate_config(&cfg);
     Json(FleetManifest {

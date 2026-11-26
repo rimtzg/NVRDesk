@@ -55,6 +55,7 @@ enum CliEncoderBackend {
 enum CliWebcamMode {
     Pip,
     Channel,
+    VirtualOnvif,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -183,17 +184,25 @@ struct Cli {
     #[arg(long, value_enum)]
     keystroke_mode: Option<CliKeystrokeMode>,
 
-    /// Enable webcam capture (PiP or dedicated `/webcam` RTSP channel).
+    /// Enable webcam capture (PiP, `/webcam` RTSP channel, or standalone Virtual ONVIF camera).
     #[arg(long, default_value_t = false)]
     webcam: bool,
 
-    /// Webcam integration mode (`pip` or `channel`).
+    /// Webcam integration mode (`pip`, `channel`, or `virtual-onvif`).
     #[arg(long, value_enum)]
     webcam_mode: Option<CliWebcamMode>,
 
     /// Webcam device index.
     #[arg(long)]
     webcam_device: Option<usize>,
+
+    /// ONVIF HTTP(S) listening port for `virtual-onvif` webcam mode (default `8081`).
+    #[arg(long)]
+    webcam_http_port: Option<u16>,
+
+    /// RTSP listening port for `virtual-onvif` webcam mode (default `8555`).
+    #[arg(long)]
+    webcam_rtsp_port: Option<u16>,
 
     /// Enable microphone audio capture (G.711 PCMU/PCMA on `trackID=1`).
     #[arg(long, default_value_t = false)]
@@ -637,10 +646,17 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
         cfg.webcam.mode = match mode {
             CliWebcamMode::Pip => WebcamMode::Pip,
             CliWebcamMode::Channel => WebcamMode::Channel,
+            CliWebcamMode::VirtualOnvif => WebcamMode::VirtualOnvif,
         };
     }
     if let Some(idx) = cli.webcam_device {
         cfg.webcam.device_index = idx;
+    }
+    if let Some(port) = cli.webcam_http_port {
+        cfg.webcam.onvif_http_port = port;
+    }
+    if let Some(port) = cli.webcam_rtsp_port {
+        cfg.webcam.rtsp_port = port;
     }
     if cli.audio {
         cfg.audio.enabled = true;

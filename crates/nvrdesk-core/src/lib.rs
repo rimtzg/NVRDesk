@@ -333,8 +333,10 @@ pub enum WebcamMode {
     /// Composite webcam as Picture-in-Picture over the POS desktop.
     #[default]
     Pip,
-    /// Expose webcam as an independent RTSP/ONVIF stream (`/webcam`).
+    /// Expose webcam as an independent RTSP/ONVIF stream (`/webcam`) on the primary server.
     Channel,
+    /// Expose webcam as a separate virtual ONVIF/RTSP IP camera with MainStream (`/stream1`) + SubStream (`/stream2`).
+    VirtualOnvif,
 }
 
 /// Picture-in-Picture corner placement.
@@ -361,6 +363,14 @@ pub struct WebcamConfig {
     pub max_width: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// Dedicated ONVIF HTTP/HTTPS listening port when `mode = "virtual_onvif"` (default `8081`).
+    pub onvif_http_port: u16,
+    /// Dedicated RTSP listening port when `mode = "virtual_onvif"` (default `8555`).
+    pub rtsp_port: u16,
+    /// Dedicated RTSPS listening port when TLS is enabled and `mode = "virtual_onvif"` (default `8323`).
+    pub rtsps_port: u16,
+    /// Optional custom ONVIF device name for the virtual webcam camera.
+    pub onvif_device_name: Option<String>,
 }
 
 impl Default for WebcamConfig {
@@ -375,6 +385,10 @@ impl Default for WebcamConfig {
             max_width: 640,
             fps: 10,
             bitrate_bps: 600_000,
+            onvif_http_port: 8081,
+            rtsp_port: 8555,
+            rtsps_port: 8323,
+            onvif_device_name: None,
         }
     }
 }

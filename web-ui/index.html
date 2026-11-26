@@ -209,9 +209,10 @@
               Webcam Mode
               <select id="cfg-webcam-mode">
                 <option value="pip">Picture-in-Picture</option>
+                <option value="virtual_onvif">Separate Virtual ONVIF Camera (Main + Sub)</option>
                 <option value="channel">Dedicated RTSP Channel (/webcam)</option>
               </select>
-              <span class="field-hint">PiP composites the webcam onto the screen stream; Channel exposes a separate /webcam URI.</span>
+              <span class="field-hint">PiP composites on desktop; Separate Virtual ONVIF exposes a 2nd camera with /stream1 + /stream2 (recommended for Dahua NVRs).</span>
             </label>
             <label>
               PiP Corner
@@ -222,6 +223,16 @@
                 <option value="bottom_left">Bottom Left</option>
               </select>
               <span class="field-hint">Screen corner where the webcam overlay is placed when Webcam Mode is PiP.</span>
+            </label>
+            <label>
+              Webcam ONVIF Port
+              <input id="cfg-webcam-onvif-port" type="number" min="1" max="65535" value="8081" />
+              <span class="field-hint">Dedicated ONVIF Device HTTP(S) port when using Separate Virtual ONVIF Camera mode.</span>
+            </label>
+            <label>
+              Webcam RTSP Port
+              <input id="cfg-webcam-rtsp-port" type="number" min="1" max="65535" value="8555" />
+              <span class="field-hint">Dedicated RTSP port serving /stream1 (Main) and /stream2 (Sub) for the virtual webcam.</span>
             </label>
             <div class="checkbox-field">
               <label class="checkbox-row">

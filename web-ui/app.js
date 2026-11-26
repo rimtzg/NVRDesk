@@ -78,6 +78,8 @@ async function loadInitial() {
   document.getElementById("cfg-webcam-enabled").checked = cfg.webcam.enabled;
   document.getElementById("cfg-webcam-mode").value = cfg.webcam.mode;
   document.getElementById("cfg-pip-pos").value = cfg.webcam.pip_position;
+  document.getElementById("cfg-webcam-onvif-port").value = cfg.webcam.onvif_http_port || 8081;
+  document.getElementById("cfg-webcam-rtsp-port").value = cfg.webcam.rtsp_port || 8555;
 
   document.getElementById("cfg-audio-enabled").checked = cfg.audio.enabled;
   document.getElementById("cfg-audio-codec").value = cfg.audio.codec;
@@ -182,6 +184,8 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   updated.webcam.device_index = Number(document.getElementById("cfg-webcam-device").value) || 0;
   updated.webcam.mode = document.getElementById("cfg-webcam-mode").value;
   updated.webcam.pip_position = document.getElementById("cfg-pip-pos").value;
+  updated.webcam.onvif_http_port = Number(document.getElementById("cfg-webcam-onvif-port").value) || 8081;
+  updated.webcam.rtsp_port = Number(document.getElementById("cfg-webcam-rtsp-port").value) || 8555;
 
   updated.audio.enabled = document.getElementById("cfg-audio-enabled").checked;
   const micVal = document.getElementById("cfg-audio-device").value;
@@ -222,6 +226,7 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updated),
     });
+    await refreshStatus();
     msg.textContent = "Configuration saved and applied.";
     setTimeout(() => { msg.textContent = ""; }, 3000);
   } catch (err) {
