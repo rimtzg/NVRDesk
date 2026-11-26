@@ -397,6 +397,7 @@ input, select, textarea {
 .btn-primary { background: var(--accent); color: #fff; }
 .btn-secondary { background: #263142; color: var(--text); }
 .save-msg { margin: 10px 0 0; font-size: 0.85rem; color: var(--ok); min-height: 1.1em; }
+.is-hidden { display: none !important; }
 
 @media (max-width: 860px) {
   .grid { grid-template-columns: 1fr; }

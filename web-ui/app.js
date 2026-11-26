@@ -106,6 +106,56 @@ function populateMicSelect(el, items, selectedName, defaultLabel = "System Defau
   }
 }
 
+function setFieldVisible(inputId, visible) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const wrapper = input.closest(".checkbox-field") || input.closest("label");
+  if (wrapper) {
+    wrapper.classList.toggle("is-hidden", !visible);
+  }
+}
+
+function syncConditionalFields() {
+  const sourceKind = document.getElementById("cfg-source-kind").value;
+  const usesUri = ["mp4", "mjpeg", "rtmp", "rtsp_relay", "ffmpeg_uri"].includes(sourceKind);
+  setFieldVisible("cfg-display", sourceKind === "screen");
+  setFieldVisible("cfg-source-uri", usesUri);
+
+  const webcamEnabled = document.getElementById("cfg-webcam-enabled").checked;
+  const webcamMode = document.getElementById("cfg-webcam-mode").value;
+  const canExtraVirtual = webcamMode === "pip" || webcamMode === "channel";
+  const extraVirtualChecked = document.getElementById("cfg-webcam-virtual-onvif").checked;
+  const usesPip = webcamEnabled && (webcamMode === "pip" || webcamMode === "pip_and_virtual_onvif");
+  const usesVirtualOnvif = webcamEnabled
+    && (webcamMode === "virtual_onvif"
+      || webcamMode === "pip_and_virtual_onvif"
+      || (canExtraVirtual && extraVirtualChecked));
+  const usesWebcamStream = webcamEnabled && (usesVirtualOnvif || webcamMode === "channel");
+  const webcamAudioEnabled = usesWebcamStream
+    && document.getElementById("cfg-webcam-audio-enabled").checked;
+
+  setFieldVisible("cfg-webcam-device", webcamEnabled);
+  setFieldVisible("cfg-webcam-mode", webcamEnabled);
+  setFieldVisible("cfg-webcam-virtual-onvif", webcamEnabled && canExtraVirtual);
+  setFieldVisible("cfg-pip-pos", usesPip);
+  setFieldVisible("cfg-webcam-onvif-port", usesVirtualOnvif);
+  setFieldVisible("cfg-webcam-rtsp-port", usesVirtualOnvif);
+  setFieldVisible("cfg-webcam-audio-enabled", usesWebcamStream);
+  setFieldVisible("cfg-webcam-audio-device", webcamAudioEnabled);
+
+  const micEnabled = document.getElementById("cfg-audio-enabled").checked;
+  setFieldVisible("cfg-audio-device", micEnabled);
+  setFieldVisible("cfg-audio-codec", micEnabled || webcamAudioEnabled);
+
+  const recEnabled = document.getElementById("cfg-rec-enabled").checked;
+  setFieldVisible("cfg-rec-max-mb", recEnabled);
+
+  const srtEnabled = document.getElementById("cfg-srt-enabled").checked;
+  setFieldVisible("cfg-srt-mode", srtEnabled);
+  setFieldVisible("cfg-srt-target", srtEnabled);
+  setFieldVisible("cfg-srt-latency", srtEnabled);
+}
+
 async function loadInitial() {
   const [devices, cfg, templates] = await Promise.all([
     fetchJson("/api/v1/devices"),
@@ -172,6 +222,7 @@ async function loadInitial() {
   document.getElementById("cfg-srt-target").value = (cfg.srt && cfg.srt.target) ? cfg.srt.target : "";
   document.getElementById("cfg-srt-latency").value = cfg.srt ? cfg.srt.latency_ms : 120;
   document.getElementById("cfg-fleet-id").value = cfg.fleet ? `${cfg.fleet.site}/${cfg.fleet.terminal_id}` : "default-site/pos-01";
+  syncConditionalFields();
 }
 
 async function refreshStatus() {
@@ -322,6 +373,20 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   } catch (err) {
     msg.textContent = `Save failed: ${err.message}`;
   }
+});
+
+[
+  "cfg-source-kind",
+  "cfg-webcam-enabled",
+  "cfg-webcam-mode",
+  "cfg-webcam-virtual-onvif",
+  "cfg-webcam-audio-enabled",
+  "cfg-audio-enabled",
+  "cfg-rec-enabled",
+  "cfg-srt-enabled",
+].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", syncConditionalFields);
 });
 
 loadInitial().then(refreshStatus);
