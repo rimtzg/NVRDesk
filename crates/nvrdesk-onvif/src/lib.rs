@@ -11,5 +11,5 @@ pub use server::{
     OnvifServer, SnapshotProvider, build_onvif_router, build_onvif_router_with_events,
 };
 pub use soap::{OnvifDeviceMeta, OnvifMediaProfile};
-pub use ws_discovery::{WsDiscoveryConfig, run_ws_discovery};
+pub use ws_discovery::{WsDiscoveryConfig, run_ws_discovery, run_ws_discovery_watch};
 pub use ws_security::OnvifAuthConfig;

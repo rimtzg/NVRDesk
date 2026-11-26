@@ -338,6 +338,41 @@ pub fn validate_config(cfg: &NvrDeskConfig) -> ValidationReport {
     if cfg.tls.rtsps_enabled && cfg.tls.rtsps_port > 0 && cfg.tls.rtsps_port == cfg.rtsp.port {
         errors.push("port conflict: tls.rtsps_port equals rtsp.port".into());
     }
+    if cfg.webcam.uses_virtual_onvif() {
+        let cam_http = cfg.webcam.onvif_http_port;
+        let cam_rtsp = cfg.webcam.rtsp_port;
+        if cam_rtsp > 0 && (cam_rtsp == cfg.rtsp.port || cam_rtsp == cfg.onvif.http_port) {
+            errors.push(format!(
+                "port conflict: webcam.rtsp_port ({cam_rtsp}) collides with primary server port"
+            ));
+        }
+        if cam_http > 0
+            && (cam_http == cfg.rtsp.port
+                || ((cfg.onvif.enabled || cfg.daemon.web_ui_enabled)
+                    && cam_http == cfg.onvif.http_port))
+        {
+            errors.push(format!(
+                "port conflict: webcam.onvif_http_port ({cam_http}) collides with primary server port"
+            ));
+        }
+        if cam_rtsp > 0 && cam_http > 0 && cam_rtsp == cam_http {
+            errors.push(format!(
+                "port conflict: webcam.rtsp_port ({cam_rtsp}) equals webcam.onvif_http_port ({cam_http})"
+            ));
+        }
+        if cfg.tls.rtsps_enabled && cfg.webcam.rtsps_port > 0 {
+            let cam_rtsps = cfg.webcam.rtsps_port;
+            if cam_rtsps == cfg.tls.rtsps_port
+                || cam_rtsps == cfg.rtsp.port
+                || cam_rtsps == cam_rtsp
+                || cam_rtsps == cam_http
+            {
+                errors.push(format!(
+                    "port conflict: webcam.rtsps_port ({cam_rtsps}) collides with another port"
+                ));
+            }
+        }
+    }
 
     if cfg.source.kind.is_ffmpeg_pull()
         && cfg
@@ -487,5 +522,23 @@ mod tests {
         assert!(report.warnings.is_empty());
         assert!(cfg.tls.https_enabled);
         assert_eq!(cfg.pos.privacy_masks.len(), 1);
+    }
+
+    #[test]
+    fn validate_catches_virtual_onvif_webcam_port_collisions() {
+        let mut cfg = NvrDeskConfig::default();
+        cfg.webcam.enabled = true;
+        cfg.webcam.mode = WebcamMode::VirtualOnvif;
+        assert!(validate_config(&cfg).valid);
+
+        cfg.webcam.onvif_http_port = cfg.onvif.http_port;
+        let report = validate_config(&cfg);
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("webcam.onvif_http_port"))
+        );
     }
 }

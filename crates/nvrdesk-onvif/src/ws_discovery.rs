@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use nvrdesk_core::NvrDeskError;
 use quick_xml::{Reader, events::Event};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -26,8 +26,16 @@ struct ProbeInfo {
     message_id: String,
 }
 
-/// Runs the WS-Discovery multicast responder loop.
+/// Runs the WS-Discovery multicast responder loop for a single ONVIF device.
 pub async fn run_ws_discovery(cfg: WsDiscoveryConfig) -> Result<(), NvrDeskError> {
+    let (_tx, rx) = watch::channel(vec![cfg]);
+    run_ws_discovery_watch(rx).await
+}
+
+/// Runs the WS-Discovery multicast responder loop, advertising every active ONVIF virtual device in `configs_rx`.
+pub async fn run_ws_discovery_watch(
+    configs_rx: watch::Receiver<Vec<WsDiscoveryConfig>>,
+) -> Result<(), NvrDeskError> {
     let std_sock = bind_multicast_socket()?;
     let udp = UdpSocket::from_std(std_sock)?;
 
@@ -36,11 +44,14 @@ pub async fn run_ws_discovery(cfg: WsDiscoveryConfig) -> Result<(), NvrDeskError
         return Ok(());
     }
 
-    info!(
-        uuid = %cfg.device_uuid,
-        http_port = cfg.http_port,
-        "ONVIF WS-Discovery listening on 239.255.255.250:3702"
-    );
+    for cfg in configs_rx.borrow().iter() {
+        info!(
+            uuid = %cfg.device_uuid,
+            http_port = cfg.http_port,
+            device_name = %cfg.device_name,
+            "ONVIF WS-Discovery listening on 239.255.255.250:3702"
+        );
+    }
 
     let mut buf = vec![0u8; 8192];
     loop {
@@ -48,11 +59,14 @@ pub async fn run_ws_discovery(cfg: WsDiscoveryConfig) -> Result<(), NvrDeskError
         let payload = String::from_utf8_lossy(&buf[..n]);
         if let Some(probe_info) = parse_probe(&payload) {
             let local_ip = resolve_local_ip_for_peer(peer_addr);
-            let reply = build_probe_match(&cfg, &probe_info.message_id, &local_ip);
-            if let Err(err) = udp.send_to(reply.as_bytes(), peer_addr).await {
-                debug!(%peer_addr, error = %err, "failed to send WS-Discovery ProbeMatches");
-            } else {
-                debug!(%peer_addr, %local_ip, "sent WS-Discovery ProbeMatches");
+            let active_cfgs = configs_rx.borrow().clone();
+            for cfg in &active_cfgs {
+                let reply = build_probe_match(cfg, &probe_info.message_id, &local_ip);
+                if let Err(err) = udp.send_to(reply.as_bytes(), peer_addr).await {
+                    debug!(%peer_addr, http_port = cfg.http_port, error = %err, "failed to send WS-Discovery ProbeMatches");
+                } else {
+                    debug!(%peer_addr, %local_ip, http_port = cfg.http_port, "sent WS-Discovery ProbeMatches");
+                }
             }
         }
     }

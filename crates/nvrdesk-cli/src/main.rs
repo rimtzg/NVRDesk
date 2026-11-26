@@ -1,5 +1,7 @@
 //! NVRDesk CLI entrypoint launching the daemon (RTSP/ONVIF/Web UI) and System Tray.
 
+mod updater;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{
@@ -55,6 +57,8 @@ enum CliEncoderBackend {
 enum CliWebcamMode {
     Pip,
     Channel,
+    VirtualOnvif,
+    PipAndVirtualOnvif,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -183,17 +187,37 @@ struct Cli {
     #[arg(long, value_enum)]
     keystroke_mode: Option<CliKeystrokeMode>,
 
-    /// Enable webcam capture (PiP or dedicated `/webcam` RTSP channel).
+    /// Enable webcam capture (PiP, `/webcam` RTSP channel, or standalone Virtual ONVIF camera).
     #[arg(long, default_value_t = false)]
     webcam: bool,
 
-    /// Webcam integration mode (`pip` or `channel`).
+    /// Webcam integration mode (`pip`, `channel`, `virtual-onvif`, or `pip-and-virtual-onvif`).
     #[arg(long, value_enum)]
     webcam_mode: Option<CliWebcamMode>,
+
+    /// Also expose a standalone Virtual ONVIF camera alongside PiP/Channel mode.
+    #[arg(long, default_value_t = false)]
+    webcam_virtual_onvif: bool,
+
+    /// Enable microphone audio on the Virtual ONVIF / dedicated webcam stream.
+    #[arg(long, default_value_t = false)]
+    webcam_audio: bool,
+
+    /// Optional dedicated microphone device name for the webcam stream.
+    #[arg(long)]
+    webcam_audio_device: Option<String>,
 
     /// Webcam device index.
     #[arg(long)]
     webcam_device: Option<usize>,
+
+    /// ONVIF HTTP(S) listening port for `virtual-onvif` webcam mode (default `8081`).
+    #[arg(long)]
+    webcam_http_port: Option<u16>,
+
+    /// RTSP listening port for `virtual-onvif` webcam mode (default `8555`).
+    #[arg(long)]
+    webcam_rtsp_port: Option<u16>,
 
     /// Enable microphone audio capture (G.711 PCMU/PCMA on `trackID=1`).
     #[arg(long, default_value_t = false)]
@@ -274,6 +298,18 @@ struct Cli {
     /// Target Linux desktop username for `--install-service` (defaults to `$SUDO_USER` / `$USER`).
     #[arg(long)]
     service_user: Option<String>,
+
+    /// Do not enable the periodic `.deb` auto-update systemd timer during `--install-service`.
+    #[arg(long, default_value_t = false)]
+    no_auto_update: bool,
+
+    /// Check GitHub Releases for a newer NVRDesk version and exit.
+    #[arg(long, default_value_t = false)]
+    check_update: bool,
+
+    /// Download, SHA-256 verify, and install the latest `.deb` release (Linux, requires root).
+    #[arg(long, default_value_t = false)]
+    self_update: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -339,6 +375,12 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.check_update {
+        return updater::check_update();
+    }
+    if cli.self_update {
+        return updater::self_update();
+    }
     if let Some(Commands::Fleet { action }) = cli.command {
         return handle_fleet_command(action);
     }
@@ -398,7 +440,13 @@ fn main() -> Result<()> {
 
     if cli.install_service {
         let target_cfg = config_path.as_deref().expect("service config path set");
-        return install_systemd_service(target_cfg, &cfg, cli.service_user.as_deref(), cli.no_tray);
+        return install_systemd_service(
+            target_cfg,
+            &cfg,
+            cli.service_user.as_deref(),
+            cli.no_tray,
+            !cli.no_auto_update,
+        );
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -637,10 +685,27 @@ fn apply_cli_overrides(cli: &Cli, cfg: &mut NvrDeskConfig) {
         cfg.webcam.mode = match mode {
             CliWebcamMode::Pip => WebcamMode::Pip,
             CliWebcamMode::Channel => WebcamMode::Channel,
+            CliWebcamMode::VirtualOnvif => WebcamMode::VirtualOnvif,
+            CliWebcamMode::PipAndVirtualOnvif => WebcamMode::PipAndVirtualOnvif,
         };
+    }
+    if cli.webcam_virtual_onvif {
+        cfg.webcam.virtual_onvif_enabled = true;
+    }
+    if cli.webcam_audio {
+        cfg.webcam.audio_enabled = true;
+    }
+    if let Some(dev) = &cli.webcam_audio_device {
+        cfg.webcam.audio_device_name = Some(dev.clone());
     }
     if let Some(idx) = cli.webcam_device {
         cfg.webcam.device_index = idx;
+    }
+    if let Some(port) = cli.webcam_http_port {
+        cfg.webcam.onvif_http_port = port;
+    }
+    if let Some(port) = cli.webcam_rtsp_port {
+        cfg.webcam.rtsp_port = port;
     }
     if cli.audio {
         cfg.audio.enabled = true;
@@ -806,6 +871,7 @@ fn install_systemd_service(
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
     headless: bool,
+    auto_update: bool,
 ) -> Result<()> {
     use anyhow::Context;
     use std::process::Command;
@@ -851,6 +917,29 @@ fn install_systemd_service(
         )
     })?;
 
+    let updater_svc_path = PathBuf::from("/etc/systemd/system/nvrdesk-updater.service");
+    let updater_timer_path = PathBuf::from("/etc/systemd/system/nvrdesk-updater.timer");
+    if auto_update {
+        std::fs::write(
+            &updater_svc_path,
+            updater::render_updater_service(&exe_path),
+        )
+        .with_context(|| {
+            format!(
+                "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+                updater_svc_path.display()
+            )
+        })?;
+        std::fs::write(&updater_timer_path, updater::render_updater_timer()).with_context(
+            || {
+                format!(
+                    "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+                    updater_timer_path.display()
+                )
+            },
+        )?;
+    }
+
     let reload = Command::new("systemctl")
         .arg("daemon-reload")
         .status()
@@ -872,10 +961,28 @@ fn install_systemd_service(
         .args(["restart", &unit_instance])
         .status();
 
+    if auto_update {
+        let enable_timer = Command::new("systemctl")
+            .args(["enable", "--now", "nvrdesk-updater.timer"])
+            .status()
+            .context("failed to enable nvrdesk-updater.timer")?;
+        if !enable_timer.success() {
+            anyhow::bail!(
+                "`systemctl enable --now nvrdesk-updater.timer` exited with {enable_timer}"
+            );
+        }
+    }
+
     println!("Installed NVRDesk systemd service:");
     println!("  Config : {}", config_path.display());
     println!("  Unit   : {}", unit_path.display());
     println!("  Service: {unit_instance} (enabled & started)");
+    if auto_update {
+        println!(
+            "  Updater: {} (enabled, checks GitHub Releases every 12h)",
+            updater_timer_path.display()
+        );
+    }
     println!("  Logs   : journalctl -u {unit_instance} -f");
     Ok(())
 }
@@ -886,8 +993,9 @@ fn install_systemd_service(
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
     headless: bool,
+    auto_update: bool,
 ) -> Result<()> {
-    let _ = (config_path, cfg, explicit_user, headless);
+    let _ = (config_path, cfg, explicit_user, headless, auto_update);
     anyhow::bail!(
         "`--install-service` is only supported on Linux (systemd). Use `packaging/fleet/windows/Install-NvrDeskPos.ps1` on Windows or `packaging/fleet/macos/com.nvrdesk.agent.plist` on macOS."
     )

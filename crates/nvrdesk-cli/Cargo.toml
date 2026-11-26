@@ -21,6 +21,7 @@ nvrdesk-core = { path = "../nvrdesk-core" }
 nvrdesk-daemon = { path = "../nvrdesk-daemon" }
 nvrdesk-tray = { path = "../nvrdesk-tray" }
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -46,7 +47,7 @@ NVRDesk is a cross-platform, MIT-licensed ONVIF/RTSP virtual IP camera
 for POS terminals and desktop monitoring."""
 section = "video"
 priority = "optional"
-depends = "libasound2t64 (>= 1.1.0), libc6 (>= 2.39), libgbm1 (>= 17.1.0~rc2), libpipewire-0.3-0t64 (>= 0.3.1), libstdc++6 (>= 5), libwayland-client0 (>= 1.11.0), libx11-6, libxcb1 (>= 1.11.1), libxtst6 (>= 2:1.2.3)"
+depends = "curl, libasound2t64 (>= 1.1.0), libc6 (>= 2.39), libgbm1 (>= 17.1.0~rc2), libpipewire-0.3-0t64 (>= 0.3.1), libstdc++6 (>= 5), libwayland-client0 (>= 1.11.0), libx11-6, libxcb1 (>= 1.11.1), libxtst6 (>= 2:1.2.3)"
 assets = [
     ["target/release/nvrdesk", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/nvrdesk/README.md", "644"],

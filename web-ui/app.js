@@ -3,6 +3,69 @@ let privacyMasksState = [];
 let draftMasks = [];
 let selectedMaskIdx = -1;
 let dragOp = null;
+let lastEndpointsKey = "";
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      // Fall through to execCommand fallback
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  return ok;
+}
+
+function renderEndpointsList(container, endpoints) {
+  const key = JSON.stringify(endpoints || []);
+  if (key === lastEndpointsKey) return;
+  lastEndpointsKey = key;
+
+  const frag = document.createDocumentFragment();
+  for (const ep of endpoints || []) {
+    const row = document.createElement("div");
+    row.className = "endpoint-row";
+
+    const labelEl = document.createElement("span");
+    labelEl.textContent = ep.label;
+
+    const valueWrap = document.createElement("div");
+    valueWrap.className = "endpoint-value";
+
+    const codeEl = document.createElement("code");
+    codeEl.textContent = ep.url;
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "btn-copy";
+    copyBtn.dataset.copyUrl = ep.url;
+    copyBtn.textContent = "Copy";
+    copyBtn.title = `Copy ${ep.label} URL`;
+
+    valueWrap.appendChild(codeEl);
+    valueWrap.appendChild(copyBtn);
+    row.appendChild(labelEl);
+    row.appendChild(valueWrap);
+    frag.appendChild(row);
+  }
+  container.replaceChildren(frag);
+}
 
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts);
@@ -28,11 +91,11 @@ function populateSelect(el, items, selectedIdx, defaultLabel) {
   }
 }
 
-function populateMicSelect(el, items, selectedName) {
+function populateMicSelect(el, items, selectedName, defaultLabel = "System Default Microphone") {
   el.innerHTML = "";
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = "System Default Microphone";
+  def.textContent = defaultLabel;
   el.appendChild(def);
   for (const item of items || []) {
     const opt = document.createElement("option");
@@ -41,6 +104,62 @@ function populateMicSelect(el, items, selectedName) {
     if (selectedName && item.name === selectedName) opt.selected = true;
     el.appendChild(opt);
   }
+}
+
+function setFieldVisible(inputId, visible) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const wrapper = input.closest(".checkbox-field") || input.closest("label");
+  if (wrapper) {
+    wrapper.classList.toggle("is-hidden", !visible);
+  }
+}
+
+function setGroupVisible(id, visible) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.classList.toggle("is-hidden", !visible);
+  }
+}
+
+function syncConditionalFields() {
+  const sourceKind = document.getElementById("cfg-source-kind").value;
+  const usesUri = ["mp4", "mjpeg", "rtmp", "rtsp_relay", "ffmpeg_uri"].includes(sourceKind);
+  setFieldVisible("cfg-display", sourceKind === "screen");
+  setFieldVisible("cfg-source-uri", usesUri);
+
+  const webcamEnabled = document.getElementById("cfg-webcam-enabled").checked;
+  const webcamMode = document.getElementById("cfg-webcam-mode").value;
+  const canExtraVirtual = webcamMode === "pip" || webcamMode === "channel";
+  const extraVirtualChecked = document.getElementById("cfg-webcam-virtual-onvif").checked;
+  const usesPip = webcamEnabled && (webcamMode === "pip" || webcamMode === "pip_and_virtual_onvif");
+  const usesVirtualOnvif = webcamEnabled
+    && (webcamMode === "virtual_onvif"
+      || webcamMode === "pip_and_virtual_onvif"
+      || (canExtraVirtual && extraVirtualChecked));
+  const usesWebcamStream = webcamEnabled && (usesVirtualOnvif || webcamMode === "channel");
+  const webcamAudioEnabled = usesWebcamStream
+    && document.getElementById("cfg-webcam-audio-enabled").checked;
+
+  setGroupVisible("webcam-settings-group", webcamEnabled);
+  setGroupVisible("webcam-virtual-onvif-group", usesVirtualOnvif);
+  setGroupVisible("webcam-audio-group", usesWebcamStream);
+
+  setFieldVisible("cfg-webcam-virtual-onvif", webcamEnabled && canExtraVirtual);
+  setFieldVisible("cfg-pip-pos", usesPip);
+  setFieldVisible("cfg-webcam-audio-device", webcamAudioEnabled);
+
+  const micEnabled = document.getElementById("cfg-audio-enabled").checked;
+  setFieldVisible("cfg-audio-device", micEnabled);
+  setFieldVisible("cfg-audio-codec", micEnabled || webcamAudioEnabled);
+
+  const recEnabled = document.getElementById("cfg-rec-enabled").checked;
+  setFieldVisible("cfg-rec-max-mb", recEnabled);
+
+  const srtEnabled = document.getElementById("cfg-srt-enabled").checked;
+  setFieldVisible("cfg-srt-mode", srtEnabled);
+  setFieldVisible("cfg-srt-target", srtEnabled);
+  setFieldVisible("cfg-srt-latency", srtEnabled);
 }
 
 async function loadInitial() {
@@ -66,6 +185,12 @@ async function loadInitial() {
   populateSelect(document.getElementById("cfg-display"), devices.monitors, cfg.source.display, "Primary Display");
   populateSelect(document.getElementById("cfg-webcam-device"), devices.webcams, cfg.webcam.device_index, "No Webcam Found");
   populateMicSelect(document.getElementById("cfg-audio-device"), devices.microphones, cfg.audio.device_name);
+  populateMicSelect(
+    document.getElementById("cfg-webcam-audio-device"),
+    devices.microphones,
+    cfg.webcam.audio_device_name,
+    "Same as Main / Default Microphone",
+  );
 
   document.getElementById("cfg-encoder-backend").value = cfg.encoder.backend;
   document.getElementById("cfg-main-codec").value = cfg.main_stream.codec || "h264";
@@ -77,7 +202,11 @@ async function loadInitial() {
 
   document.getElementById("cfg-webcam-enabled").checked = cfg.webcam.enabled;
   document.getElementById("cfg-webcam-mode").value = cfg.webcam.mode;
+  document.getElementById("cfg-webcam-virtual-onvif").checked = Boolean(cfg.webcam.virtual_onvif_enabled);
   document.getElementById("cfg-pip-pos").value = cfg.webcam.pip_position;
+  document.getElementById("cfg-webcam-onvif-port").value = cfg.webcam.onvif_http_port || 8081;
+  document.getElementById("cfg-webcam-rtsp-port").value = cfg.webcam.rtsp_port || 8555;
+  document.getElementById("cfg-webcam-audio-enabled").checked = Boolean(cfg.webcam.audio_enabled);
 
   document.getElementById("cfg-audio-enabled").checked = cfg.audio.enabled;
   document.getElementById("cfg-audio-codec").value = cfg.audio.codec;
@@ -99,6 +228,7 @@ async function loadInitial() {
   document.getElementById("cfg-srt-target").value = (cfg.srt && cfg.srt.target) ? cfg.srt.target : "";
   document.getElementById("cfg-srt-latency").value = cfg.srt ? cfg.srt.latency_ms : 120;
   document.getElementById("cfg-fleet-id").value = cfg.fleet ? `${cfg.fleet.site}/${cfg.fleet.terminal_id}` : "default-site/pos-01";
+  syncConditionalFields();
 }
 
 async function refreshStatus() {
@@ -137,9 +267,7 @@ async function refreshStatus() {
     }
 
     const endpoints = document.getElementById("endpoints-list");
-    endpoints.innerHTML = st.endpoints
-      .map((ep) => `<div class="endpoint-row"><span>${ep.label}</span><code>${ep.url}</code></div>`)
-      .join("");
+    renderEndpointsList(endpoints, st.endpoints);
 
     const feed = document.getElementById("events-feed");
     const events = st.recent_events || [];
@@ -152,6 +280,23 @@ async function refreshStatus() {
     document.getElementById("status-badge").textContent = "Offline";
   }
 }
+
+document.getElementById("endpoints-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".btn-copy");
+  if (!btn) return;
+  const url = btn.dataset.copyUrl;
+  if (!url) return;
+  const copied = await copyTextToClipboard(url);
+  btn.textContent = copied ? "Copied!" : "Failed";
+  btn.classList.toggle("copied", copied);
+  clearTimeout(Number(btn.dataset.resetTimer || 0));
+  btn.dataset.resetTimer = String(
+    setTimeout(() => {
+      btn.textContent = "Copy";
+      btn.classList.remove("copied");
+    }, 1800),
+  );
+});
 
 document.getElementById("preview-profile").addEventListener("change", (e) => {
   document.getElementById("preview-img").src = `/preview/${e.target.value}.mjpeg?t=${Date.now()}`;
@@ -181,7 +326,13 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
   updated.webcam.enabled = document.getElementById("cfg-webcam-enabled").checked;
   updated.webcam.device_index = Number(document.getElementById("cfg-webcam-device").value) || 0;
   updated.webcam.mode = document.getElementById("cfg-webcam-mode").value;
+  updated.webcam.virtual_onvif_enabled = document.getElementById("cfg-webcam-virtual-onvif").checked;
   updated.webcam.pip_position = document.getElementById("cfg-pip-pos").value;
+  updated.webcam.onvif_http_port = Number(document.getElementById("cfg-webcam-onvif-port").value) || 8081;
+  updated.webcam.rtsp_port = Number(document.getElementById("cfg-webcam-rtsp-port").value) || 8555;
+  updated.webcam.audio_enabled = document.getElementById("cfg-webcam-audio-enabled").checked;
+  const webcamMicVal = document.getElementById("cfg-webcam-audio-device").value;
+  updated.webcam.audio_device_name = webcamMicVal ? webcamMicVal : null;
 
   updated.audio.enabled = document.getElementById("cfg-audio-enabled").checked;
   const micVal = document.getElementById("cfg-audio-device").value;
@@ -222,11 +373,26 @@ document.getElementById("save-cfg-btn").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updated),
     });
+    await refreshStatus();
     msg.textContent = "Configuration saved and applied.";
     setTimeout(() => { msg.textContent = ""; }, 3000);
   } catch (err) {
     msg.textContent = `Save failed: ${err.message}`;
   }
+});
+
+[
+  "cfg-source-kind",
+  "cfg-webcam-enabled",
+  "cfg-webcam-mode",
+  "cfg-webcam-virtual-onvif",
+  "cfg-webcam-audio-enabled",
+  "cfg-audio-enabled",
+  "cfg-rec-enabled",
+  "cfg-srt-enabled",
+].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", syncConditionalFields);
 });
 
 loadInitial().then(refreshStatus);

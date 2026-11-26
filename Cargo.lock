@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-capture"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "cpal",
  "nokhwa",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-cli"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -2588,6 +2588,7 @@ dependencies = [
  "nvrdesk-tray",
  "serde_json",
  "sha1 0.11.0",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -2597,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-codec"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bytes",
  "nvrdesk-core",
@@ -2607,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bytes",
  "rcgen",
@@ -2621,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-daemon"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "axum",
  "bytes",
@@ -2648,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-input"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "core-foundation 0.9.4",
  "core-graphics 0.22.3",
@@ -2660,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-onvif"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "axum",
  "base64",
@@ -2677,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-pipeline"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "fast_image_resize",
  "jpeg-encoder",
@@ -2688,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-rtsp"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64",
  "bytes",
@@ -2706,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdesk-tray"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "nvrdesk-daemon",
  "objc2-app-kit",

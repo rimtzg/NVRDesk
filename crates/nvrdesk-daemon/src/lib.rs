@@ -31,12 +31,12 @@ use nvrdesk_codec::{
 use nvrdesk_core::{
     CaptureSourceKind, EncoderConfig, InputOverlaySnapshot, MonitorBounds, NvrDeskConfig,
     NvrDeskError, PipPosition, PosOverlaySnapshot, RawVideoFrame, SourceConfig, StreamConfig,
-    VideoCodecKind, WebcamMode, tls::build_tls_server_config,
+    VideoCodecKind, tls::build_tls_server_config,
 };
 use nvrdesk_input::InputTracker;
 use nvrdesk_onvif::{
     EventBroker, OnvifAuthConfig, OnvifDeviceMeta, OnvifMediaProfile, SnapshotProvider,
-    WsDiscoveryConfig, build_onvif_router_with_events, run_ws_discovery,
+    WsDiscoveryConfig, build_onvif_router_with_events, run_ws_discovery_watch,
 };
 use nvrdesk_pipeline::{FrameProcessor, compute_target_dimensions, motion::MotionDetector};
 use nvrdesk_rtsp::{
@@ -44,7 +44,8 @@ use nvrdesk_rtsp::{
     SrtStats, normalize_stream_path, spawn_srt_manager,
 };
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle as AsyncJoinHandle;
 use tokio_rustls::{TlsAcceptor, rustls};
 use tower::ServiceExt;
 use tracing::{error, info, warn};
@@ -54,7 +55,8 @@ use crate::{
     pos_osd::PosOsdStore,
     recorder::{RecordingStats, RingRecorder},
     web_ui::{
-        DaemonSharedState, DaemonStatus, build_endpoints, build_web_ui_router, select_srt_handle,
+        DaemonSharedState, DaemonStatus, VirtualWebcamPorts, build_endpoints_with_virtual,
+        build_web_ui_router, select_srt_handle,
     },
 };
 
@@ -97,6 +99,26 @@ impl DaemonHandle {
     #[must_use]
     pub const fn https_enabled(&self) -> bool {
         self.shared.https_enabled
+    }
+
+    /// Returns the RTSP port of the standalone Virtual ONVIF Webcam server, if active.
+    #[must_use]
+    pub fn virtual_webcam_rtsp_port(&self) -> Option<u16> {
+        self.shared
+            .virtual_webcam_ports
+            .read()
+            .expect("virtual webcam ports lock")
+            .map(|p| p.rtsp_port)
+    }
+
+    /// Returns the ONVIF HTTP(S) port of the standalone Virtual ONVIF Webcam server, if active.
+    #[must_use]
+    pub fn virtual_webcam_http_port(&self) -> Option<u16> {
+        self.shared
+            .virtual_webcam_ports
+            .read()
+            .expect("virtual webcam ports lock")
+            .and_then(|p| p.http_port)
     }
 
     /// Pauses video/audio streaming and encoding.
@@ -157,13 +179,18 @@ impl DaemonHandle {
                 .read()
                 .expect("srt stats lock")
                 .clone(),
-            endpoints: build_endpoints(
+            endpoints: build_endpoints_with_virtual(
                 &cfg,
                 &self.shared.display_ip,
                 self.shared.rtsp_port,
                 self.shared.rtsps_port,
                 self.shared.http_port,
                 self.shared.https_enabled,
+                self.shared
+                    .virtual_webcam_ports
+                    .read()
+                    .expect("virtual webcam ports lock")
+                    .as_ref(),
             ),
             active_osd_lines: self.shared.pos_osd.active_lines(Instant::now()),
             recent_events: self.shared.events.recent(10),
@@ -174,6 +201,28 @@ impl DaemonHandle {
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
+}
+
+fn capture_webcam_jpeg_snapshot(
+    latest_pip: &RwLock<Option<RawVideoFrame>>,
+    cfg: &NvrDeskConfig,
+    max_width: u32,
+) -> Result<Vec<u8>, NvrDeskError> {
+    let cam_frame = if let Some(cached) = latest_pip.read().expect("latest_pip lock").clone() {
+        cached
+    } else if cfg.webcam.enabled {
+        let mut cam = WebcamCaptureSource::new(cfg.webcam.device_index);
+        cam.start()?;
+        let frame = cam
+            .try_next_frame(Duration::from_millis(1500))?
+            .ok_or_else(|| NvrDeskError::Capture("timed out capturing webcam snapshot".into()))?;
+        cam.stop();
+        frame
+    } else {
+        return Err(NvrDeskError::Capture("webcam is disabled".into()));
+    };
+    let mut proc = FrameProcessor::new();
+    proc.encode_jpeg_snapshot_full(&cam_frame, max_width, 82, None, None)
 }
 
 struct LiveSnapshotProvider {
@@ -191,30 +240,7 @@ impl SnapshotProvider for LiveSnapshotProvider {
         let now = Instant::now();
 
         if profile_slug.eq_ignore_ascii_case("webcam") {
-            let cam_frame =
-                if let Some(cached) = self.latest_pip.read().expect("latest_pip lock").clone() {
-                    cached
-                } else if cfg.webcam.enabled {
-                    let mut cam = WebcamCaptureSource::new(cfg.webcam.device_index);
-                    cam.start()?;
-                    let frame = cam
-                        .try_next_frame(Duration::from_millis(1500))?
-                        .ok_or_else(|| {
-                            NvrDeskError::Capture("timed out capturing webcam snapshot".into())
-                        })?;
-                    cam.stop();
-                    frame
-                } else {
-                    return Err(NvrDeskError::Capture("webcam is disabled".into()));
-                };
-            let mut proc = FrameProcessor::new();
-            return proc.encode_jpeg_snapshot_full(
-                &cam_frame,
-                cfg.webcam.max_width,
-                82,
-                None,
-                None,
-            );
+            return capture_webcam_jpeg_snapshot(&self.latest_pip, &cfg, cfg.webcam.max_width);
         }
 
         let cached = self.latest_frame.read().expect("latest_frame lock").clone();
@@ -253,7 +279,7 @@ impl SnapshotProvider for LiveSnapshotProvider {
             None
         };
 
-        let pip_cached = if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Pip {
+        let pip_cached = if cfg.webcam.uses_pip() {
             self.latest_pip.read().expect("latest_pip lock").clone()
         } else {
             None
@@ -273,6 +299,431 @@ impl SnapshotProvider for LiveSnapshotProvider {
             pos_snap.as_ref(),
         )
     }
+}
+
+struct WebcamSnapshotProvider {
+    latest_pip: Arc<RwLock<Option<RawVideoFrame>>>,
+    config: Arc<RwLock<NvrDeskConfig>>,
+}
+
+impl SnapshotProvider for WebcamSnapshotProvider {
+    fn capture_jpeg(&self, profile_slug: &str) -> Result<Vec<u8>, NvrDeskError> {
+        let cfg = self.config.read().expect("config lock").clone();
+        let max_width = if profile_slug.eq_ignore_ascii_case("sub") {
+            webcam_sub_max_width(cfg.webcam.max_width)
+        } else {
+            cfg.webcam.max_width
+        };
+        capture_webcam_jpeg_snapshot(&self.latest_pip, &cfg, max_width)
+    }
+}
+
+#[derive(Clone)]
+struct VirtualWebcamHandles {
+    main_handle: RtspStreamHandle,
+    sub_handle: RtspStreamHandle,
+    registry: RtspRegistry,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VirtualWebcamSignature {
+    bind: String,
+    rtsp_port: u16,
+    rtsps_enabled: bool,
+    rtsps_port: u16,
+    onvif_enabled: bool,
+    onvif_http_port: u16,
+    https_enabled: bool,
+    device_name: String,
+    serial_number: String,
+    rtsp_username: Option<String>,
+    rtsp_password: Option<String>,
+    onvif_username: Option<String>,
+    onvif_password: Option<String>,
+    audio_enabled: bool,
+    audio_codec: nvrdesk_core::AudioCodecKind,
+    max_width: u32,
+    fps: u32,
+    bitrate_bps: u32,
+}
+
+impl VirtualWebcamSignature {
+    fn from_config(cfg: &NvrDeskConfig) -> Self {
+        Self {
+            bind: cfg.rtsp.bind.clone(),
+            rtsp_port: cfg.webcam.rtsp_port,
+            rtsps_enabled: cfg.tls.rtsps_enabled,
+            rtsps_port: cfg.webcam.rtsps_port,
+            onvif_enabled: cfg.onvif.enabled,
+            onvif_http_port: cfg.webcam.onvif_http_port,
+            https_enabled: cfg.tls.https_enabled,
+            device_name: webcam_device_name(cfg),
+            serial_number: format!("{}-CAM", cfg.onvif.serial_number),
+            rtsp_username: cfg.rtsp.username.clone(),
+            rtsp_password: cfg.rtsp.password.clone(),
+            onvif_username: cfg.onvif.username.clone(),
+            onvif_password: cfg.onvif.password.clone(),
+            audio_enabled: cfg.webcam.audio_enabled || cfg.audio.enabled,
+            audio_codec: cfg.audio.codec,
+            max_width: cfg.webcam.max_width,
+            fps: cfg.webcam.fps,
+            bitrate_bps: cfg.webcam.bitrate_bps,
+        }
+    }
+}
+
+struct VirtualWebcamRuntime {
+    signature: Option<VirtualWebcamSignature>,
+    tasks: Vec<AsyncJoinHandle<()>>,
+}
+
+impl VirtualWebcamRuntime {
+    fn new() -> Self {
+        Self {
+            signature: None,
+            tasks: Vec::new(),
+        }
+    }
+
+    fn stop(
+        &mut self,
+        slots: &Arc<RwLock<Option<VirtualWebcamHandles>>>,
+        ports_slot: &Arc<RwLock<Option<VirtualWebcamPorts>>>,
+    ) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        *slots.write().expect("virtual webcam slots lock") = None;
+        *ports_slot.write().expect("virtual webcam ports lock") = None;
+        self.signature = None;
+    }
+}
+
+fn webcam_device_name(cfg: &NvrDeskConfig) -> String {
+    cfg.webcam
+        .onvif_device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || format!("{} (Webcam)", cfg.onvif.device_name),
+            str::to_string,
+        )
+}
+
+fn webcam_sub_max_width(main_max_width: u32) -> u32 {
+    if main_max_width == 0 {
+        320
+    } else {
+        (main_max_width / 2).clamp(160, 352) & !1
+    }
+}
+
+fn webcam_main_stream_config(cfg: &NvrDeskConfig) -> StreamConfig {
+    StreamConfig {
+        codec: VideoCodecKind::H264,
+        fps: cfg.webcam.fps.max(1),
+        bitrate_bps: cfg.webcam.bitrate_bps.max(100_000),
+        max_width: cfg.webcam.max_width,
+        idr_interval_secs: 2,
+        show_cursor: false,
+    }
+}
+
+fn webcam_sub_stream_config(cfg: &NvrDeskConfig) -> StreamConfig {
+    StreamConfig {
+        codec: VideoCodecKind::H264,
+        fps: cfg.webcam.fps.clamp(1, 6),
+        bitrate_bps: (cfg.webcam.bitrate_bps / 2).max(150_000),
+        max_width: webcam_sub_max_width(cfg.webcam.max_width),
+        idr_interval_secs: 2,
+        show_cursor: false,
+    }
+}
+
+fn build_discovery_configs(
+    cfg: &NvrDeskConfig,
+    http_port: u16,
+    webcam_http_port: Option<u16>,
+) -> Vec<WsDiscoveryConfig> {
+    if !cfg.onvif.enabled || !cfg.onvif.discovery_enabled {
+        return Vec::new();
+    }
+
+    let desktop_uuid = cfg
+        .onvif
+        .device_uuid
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_DNS, cfg.onvif.serial_number.as_bytes()));
+
+    let mut list = vec![WsDiscoveryConfig {
+        device_uuid: desktop_uuid,
+        http_port,
+        device_name: cfg.onvif.device_name.clone(),
+        model: cfg.onvif.model.clone(),
+    }];
+
+    if let Some(cam_http_port) = webcam_http_port {
+        let cam_identity = format!("{}:{}:webcam", cfg.fleet.site, cfg.fleet.terminal_id);
+        let cam_uuid = Uuid::new_v5(&Uuid::NAMESPACE_DNS, cam_identity.as_bytes());
+        list.push(WsDiscoveryConfig {
+            device_uuid: cam_uuid,
+            http_port: cam_http_port,
+            device_name: webcam_device_name(cfg),
+            model: "VirtualWebcam".to_string(),
+        });
+    }
+
+    list
+}
+
+fn build_tls_for_cfg(
+    cfg: &NvrDeskConfig,
+    bind_ip: IpAddr,
+    extra_san_ip: bool,
+) -> Result<Option<Arc<rustls::ServerConfig>>, NvrDeskError> {
+    if !cfg.tls.https_enabled && !cfg.tls.rtsps_enabled {
+        return Ok(None);
+    }
+    let mut extra_sans = Vec::new();
+    if extra_san_ip && !bind_ip.is_unspecified() {
+        extra_sans.push(bind_ip.to_string());
+    }
+    build_tls_server_config(
+        cfg.tls.cert_path.as_deref(),
+        cfg.tls.key_path.as_deref(),
+        &extra_sans,
+        vec![b"http/1.1".to_vec()],
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_virtual_webcam_servers(
+    cfg: &NvrDeskConfig,
+    primary_http_port: u16,
+    runtime: &mut VirtualWebcamRuntime,
+    slots: &Arc<RwLock<Option<VirtualWebcamHandles>>>,
+    ports_slot: &Arc<RwLock<Option<VirtualWebcamPorts>>>,
+    latest_pip: &Arc<RwLock<Option<RawVideoFrame>>>,
+    shared_cfg: &Arc<RwLock<NvrDeskConfig>>,
+    webcam_events: &EventBroker,
+    disc_tx: &watch::Sender<Vec<WsDiscoveryConfig>>,
+) -> Result<(), NvrDeskError> {
+    let want_virtual = cfg.webcam.uses_virtual_onvif();
+    if !want_virtual {
+        if runtime.signature.is_some() {
+            runtime.stop(slots, ports_slot);
+            info!("stopped standalone Virtual ONVIF Webcam server");
+        }
+        let _ = disc_tx.send(build_discovery_configs(cfg, primary_http_port, None));
+        return Ok(());
+    }
+
+    let next_sig = VirtualWebcamSignature::from_config(cfg);
+    if runtime.signature.as_ref() == Some(&next_sig) {
+        return Ok(());
+    }
+
+    runtime.stop(slots, ports_slot);
+
+    let bind_ip: IpAddr = cfg
+        .rtsp
+        .bind
+        .parse()
+        .map_err(|e| NvrDeskError::Config(format!("invalid bind ip: {e}")))?;
+
+    let rtsp_auth = match (&cfg.rtsp.username, &cfg.rtsp.password) {
+        (Some(u), Some(p)) if !u.is_empty() => Some(RtspAuthConfig {
+            username: u.clone(),
+            password: p.clone(),
+        }),
+        _ => None,
+    };
+
+    let cam_audio_enabled = cfg.webcam.audio_enabled || cfg.audio.enabled;
+    let audio_codec = cam_audio_enabled.then_some(cfg.audio.codec);
+    let device_name = webcam_device_name(cfg);
+    let specs = vec![
+        RtspStreamSpec {
+            path: "/stream1".to_string(),
+            aliases: vec!["/stream".to_string()],
+            name: format!("{device_name} (Main)"),
+            video_codec: VideoCodecKind::H264,
+            audio_codec,
+            backchannel: false,
+        },
+        RtspStreamSpec {
+            path: "/stream2".to_string(),
+            aliases: Vec::new(),
+            name: format!("{device_name} (Sub)"),
+            video_codec: VideoCodecKind::H264,
+            audio_codec,
+            backchannel: false,
+        },
+    ];
+
+    let (rtsp_server, rtsp_addr, mut handles) = RtspServer::bind_streams(
+        SocketAddr::new(bind_ip, cfg.webcam.rtsp_port),
+        rtsp_auth,
+        specs,
+    )
+    .await?;
+    let rtsp_registry = rtsp_server.registry();
+    let cam_main_handle = handles.remove("/stream1").expect("webcam main handle");
+    let cam_sub_handle = handles.remove("/stream2").expect("webcam sub handle");
+
+    let mut tasks = Vec::new();
+    let tls_server_cfg = build_tls_for_cfg(cfg, bind_ip, true)?;
+    let mut cam_rtsps_port = None;
+    if cfg.tls.rtsps_enabled
+        && let Some(tls_cfg) = &tls_server_cfg
+    {
+        let rtsps_listener =
+            TcpListener::bind(SocketAddr::new(bind_ip, cfg.webcam.rtsps_port)).await?;
+        cam_rtsps_port = Some(rtsps_listener.local_addr()?.port());
+        let rtsp_tls_cfg = build_tls_server_config(
+            cfg.tls.cert_path.as_deref(),
+            cfg.tls.key_path.as_deref(),
+            &[],
+            Vec::new(),
+        )
+        .unwrap_or_else(|_| Arc::clone(tls_cfg));
+        rtsp_server.spawn_tls_listener(rtsps_listener, rtsp_tls_cfg);
+    }
+
+    let mut cam_http_port = None;
+    if cfg.onvif.enabled {
+        let listener =
+            TcpListener::bind(SocketAddr::new(bind_ip, cfg.webcam.onvif_http_port)).await?;
+        let bound_http_port = listener.local_addr()?.port();
+        cam_http_port = Some(bound_http_port);
+
+        let onvif_auth = match (&cfg.onvif.username, &cfg.onvif.password) {
+            (Some(u), Some(p)) if !u.is_empty() => Some(OnvifAuthConfig {
+                username: u.clone(),
+                password: p.clone(),
+            }),
+            _ => None,
+        };
+
+        let main_cfg = webcam_main_stream_config(cfg);
+        let sub_cfg = webcam_sub_stream_config(cfg);
+        let (main_w, main_h) = compute_target_dimensions(1280, 720, main_cfg.max_width);
+        let (sub_w, sub_h) = compute_target_dimensions(1280, 720, sub_cfg.max_width);
+        let profiles = vec![
+            OnvifMediaProfile {
+                token: "MainProfile".into(),
+                name: "MainStream".into(),
+                encoder_token: "MainEncoder".into(),
+                encoding: VideoCodecKind::H264,
+                width: main_w,
+                height: main_h,
+                fps: main_cfg.fps,
+                bitrate_kbps: main_cfg.bitrate_bps / 1000,
+                gov_length: main_cfg.fps * main_cfg.idr_interval_secs,
+                rtsp_path: "/stream1".into(),
+                snapshot_slug: "main".into(),
+            },
+            OnvifMediaProfile {
+                token: "SubProfile".into(),
+                name: "SubStream".into(),
+                encoder_token: "SubEncoder".into(),
+                encoding: VideoCodecKind::H264,
+                width: sub_w,
+                height: sub_h,
+                fps: sub_cfg.fps,
+                bitrate_kbps: sub_cfg.bitrate_bps / 1000,
+                gov_length: sub_cfg.fps * sub_cfg.idr_interval_secs,
+                rtsp_path: "/stream2".into(),
+                snapshot_slug: "sub".into(),
+            },
+        ];
+
+        let meta = OnvifDeviceMeta {
+            device_name: device_name.clone(),
+            manufacturer: cfg.onvif.manufacturer.clone(),
+            model: "VirtualWebcam".to_string(),
+            firmware_version: env!("CARGO_PKG_VERSION").to_string(),
+            serial_number: next_sig.serial_number.clone(),
+            hardware_id: "NVRDESK-WEBCAM-V1".to_string(),
+            rtsp_port: rtsp_addr.port(),
+            rtsps_port: cam_rtsps_port,
+            http_port: bound_http_port,
+            https_enabled: cfg.tls.https_enabled,
+            audio_enabled: cam_audio_enabled,
+            backchannel_enabled: false,
+        };
+
+        let webcam_snapshots: Arc<dyn SnapshotProvider> = Arc::new(WebcamSnapshotProvider {
+            latest_pip: Arc::clone(latest_pip),
+            config: Arc::clone(shared_cfg),
+        });
+        let onvif_router = build_onvif_router_with_events(
+            meta,
+            profiles,
+            onvif_auth,
+            webcam_snapshots,
+            webcam_events.clone(),
+        );
+
+        let http_tls = tls_server_cfg.filter(|_| cfg.tls.https_enabled);
+        let http_task = tokio::spawn(async move {
+            let addr = listener
+                .local_addr()
+                .unwrap_or(SocketAddr::new(bind_ip, bound_http_port));
+            if let Some(tls_cfg) = http_tls {
+                info!(%addr, "Virtual Webcam ONVIF HTTPS server listening");
+                serve_https_router(listener, onvif_router, tls_cfg).await;
+            } else {
+                info!(%addr, "Virtual Webcam ONVIF HTTP server listening");
+                if let Err(err) = axum::serve(
+                    listener,
+                    onvif_router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
+                    error!(error = %err, "Virtual Webcam ONVIF HTTP server exited with error");
+                }
+            }
+        });
+        tasks.push(http_task);
+    }
+
+    let rtsp_task = tokio::spawn(async move {
+        if let Err(err) = rtsp_server.serve().await {
+            error!(error = %err, "Virtual Webcam RTSP server exited with error");
+        }
+    });
+    tasks.push(rtsp_task);
+
+    *slots.write().expect("virtual webcam slots lock") = Some(VirtualWebcamHandles {
+        main_handle: cam_main_handle,
+        sub_handle: cam_sub_handle,
+        registry: rtsp_registry,
+    });
+    *ports_slot.write().expect("virtual webcam ports lock") = Some(VirtualWebcamPorts {
+        rtsp_port: rtsp_addr.port(),
+        rtsps_port: cam_rtsps_port,
+        http_port: cam_http_port,
+    });
+    runtime.signature = Some(next_sig);
+    runtime.tasks = tasks;
+
+    let _ = disc_tx.send(build_discovery_configs(
+        cfg,
+        primary_http_port,
+        cam_http_port,
+    ));
+
+    info!(
+        rtsp_port = rtsp_addr.port(),
+        onvif_http_port = ?cam_http_port,
+        device_name = %device_name,
+        "standalone Virtual ONVIF Webcam ready (/stream1 + /stream2)"
+    );
+    Ok(())
 }
 
 /// Starts all NVRDesk daemon subsystems on the current Tokio runtime and returns a control handle.
@@ -329,13 +780,14 @@ pub async fn start_daemon(
         });
     }
 
-    if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+    if cfg.webcam.uses_channel() {
+        let cam_audio = (cfg.webcam.audio_enabled || cfg.audio.enabled).then_some(cfg.audio.codec);
         specs.push(RtspStreamSpec {
             path: webcam_path.clone(),
             aliases: Vec::new(),
             name: format!("{} (Webcam)", cfg.onvif.device_name),
             video_codec: VideoCodecKind::H264,
-            audio_codec,
+            audio_codec: cam_audio,
             backchannel: false,
         });
     }
@@ -350,7 +802,7 @@ pub async fn start_daemon(
     } else {
         None
     };
-    let webcam_handle = if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+    let webcam_handle = if cfg.webcam.uses_channel() {
         handles.remove(&webcam_path)
     } else {
         None
@@ -451,14 +903,6 @@ pub async fn start_daemon(
     };
 
     let https_enabled = cfg.tls.https_enabled;
-    let endpoints = build_endpoints(
-        &cfg,
-        &display_ip,
-        rtsp_addr.port(),
-        rtsps_port,
-        http_port,
-        https_enabled,
-    );
 
     let main_frames = Arc::new(AtomicU64::new(0));
     let sub_frames = Arc::new(AtomicU64::new(0));
@@ -477,8 +921,52 @@ pub async fn start_daemon(
     let paused = Arc::new(AtomicBool::new(false));
     let config_gen = Arc::new(AtomicU64::new(0));
 
+    let virtual_webcam_slots: Arc<RwLock<Option<VirtualWebcamHandles>>> =
+        Arc::new(RwLock::new(None));
+    let virtual_webcam_ports: Arc<RwLock<Option<VirtualWebcamPorts>>> = Arc::new(RwLock::new(None));
+    let webcam_events = EventBroker::new();
+    let (disc_tx, disc_rx) = watch::channel(build_discovery_configs(&cfg, http_port, None));
+    let (virtual_webcam_tx, mut virtual_webcam_rx) =
+        mpsc::unbounded_channel::<(NvrDeskConfig, Option<oneshot::Sender<()>>)>();
+
+    let mut vw_runtime = VirtualWebcamRuntime::new();
+    reconcile_virtual_webcam_servers(
+        &cfg,
+        http_port,
+        &mut vw_runtime,
+        &virtual_webcam_slots,
+        &virtual_webcam_ports,
+        &latest_pip,
+        &shared_cfg,
+        &webcam_events,
+        &disc_tx,
+    )
+    .await?;
+
+    let endpoints = build_endpoints_with_virtual(
+        &cfg,
+        &display_ip,
+        rtsp_addr.port(),
+        rtsps_port,
+        http_port,
+        https_enabled,
+        virtual_webcam_ports
+            .read()
+            .expect("virtual webcam ports lock")
+            .as_ref(),
+    );
+
     let registry_for_players = rtsp_registry.clone();
-    let active_players_fn = Arc::new(move || registry_for_players.active_players());
+    let vw_slots_for_players = Arc::clone(&virtual_webcam_slots);
+    let active_players_fn = Arc::new(move || {
+        let primary = registry_for_players.active_players();
+        let cam = vw_slots_for_players
+            .read()
+            .expect("virtual webcam slots lock")
+            .as_ref()
+            .map_or(0, |s| s.registry.active_players());
+        primary + cam
+    });
 
     let shared_state = DaemonSharedState {
         config: Arc::clone(&shared_cfg),
@@ -494,6 +982,8 @@ pub async fn start_daemon(
         srt_stream_tx: srt_stream_tx.clone(),
         main_handle: main_handle.clone(),
         sub_handle_slot: Arc::clone(&sub_handle_slot),
+        virtual_webcam_ports: Arc::clone(&virtual_webcam_ports),
+        virtual_webcam_tx,
         active_players_fn,
         display_ip,
         rtsp_port: rtsp_addr.port(),
@@ -550,7 +1040,7 @@ pub async fn start_daemon(
                     snapshot_slug: "sub".into(),
                 });
             }
-            if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+            if cfg.webcam.uses_channel() {
                 let (cam_w, cam_h) = compute_target_dimensions(1280, 720, cfg.webcam.max_width);
                 profiles.push(OnvifMediaProfile {
                     token: "WebcamProfile".into(),
@@ -589,22 +1079,8 @@ pub async fn start_daemon(
             ));
 
             if cfg.onvif.discovery_enabled {
-                let uuid = cfg
-                    .onvif
-                    .device_uuid
-                    .as_deref()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                    .unwrap_or_else(|| {
-                        Uuid::new_v5(&Uuid::NAMESPACE_DNS, cfg.onvif.serial_number.as_bytes())
-                    });
-                let disc_cfg = WsDiscoveryConfig {
-                    device_uuid: uuid,
-                    http_port,
-                    device_name: cfg.onvif.device_name.clone(),
-                    model: cfg.onvif.model.clone(),
-                };
                 tokio::spawn(async move {
-                    if let Err(err) = run_ws_discovery(disc_cfg).await {
+                    if let Err(err) = run_ws_discovery_watch(disc_rx).await {
                         warn!(error = %err, "WS-Discovery responder stopped");
                     }
                 });
@@ -632,6 +1108,37 @@ pub async fn start_daemon(
             }
         });
     }
+
+    let vw_slots_mgr = Arc::clone(&virtual_webcam_slots);
+    let vw_ports_mgr = Arc::clone(&virtual_webcam_ports);
+    let vw_pip_mgr = Arc::clone(&latest_pip);
+    let vw_cfg_mgr = Arc::clone(&shared_cfg);
+    let vw_events_mgr = webcam_events.clone();
+    tokio::spawn(async move {
+        let mut runtime = vw_runtime;
+        let _keep_disc_tx = &disc_tx;
+        while let Some((next_cfg, ack)) = virtual_webcam_rx.recv().await {
+            if let Err(err) = reconcile_virtual_webcam_servers(
+                &next_cfg,
+                http_port,
+                &mut runtime,
+                &vw_slots_mgr,
+                &vw_ports_mgr,
+                &vw_pip_mgr,
+                &vw_cfg_mgr,
+                &vw_events_mgr,
+                &disc_tx,
+            )
+            .await
+            {
+                warn!(error = %err, "failed to reconfigure Virtual ONVIF Webcam server");
+            }
+            if let Some(tx) = ack {
+                let _ = tx.send(());
+            }
+        }
+        runtime.stop(&vw_slots_mgr, &vw_ports_mgr);
+    });
 
     tokio::spawn(async move {
         if let Err(err) = rtsp_server.serve().await {
@@ -665,9 +1172,11 @@ pub async fn start_daemon(
                 sub_handle_slot,
                 srt_stream_tx,
                 webcam_handle,
+                virtual_webcam_slots,
                 tracker_arc,
                 pos_osd,
                 events,
+                webcam_events,
                 latest_frame,
                 latest_bounds,
                 latest_pip,
@@ -810,17 +1319,6 @@ impl StreamPipeline {
     }
 }
 
-fn build_webcam_stream_config(cfg: &NvrDeskConfig) -> StreamConfig {
-    StreamConfig {
-        codec: VideoCodecKind::H264,
-        fps: cfg.webcam.fps.max(1),
-        bitrate_bps: cfg.webcam.bitrate_bps.max(100_000),
-        max_width: cfg.webcam.max_width,
-        idr_interval_secs: 2,
-        show_cursor: false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn reconcile_streams(
     cfg: &NvrDeskConfig,
@@ -832,6 +1330,9 @@ fn reconcile_streams(
     srt_stream_tx: &watch::Sender<Option<RtspStreamHandle>>,
     webcam_pipe: &mut Option<StreamPipeline>,
     active_webcam_path: &mut Option<String>,
+    virtual_webcam_slots: &Arc<RwLock<Option<VirtualWebcamHandles>>>,
+    webcam_main_pipe: &mut Option<StreamPipeline>,
+    webcam_sub_pipe: &mut Option<StreamPipeline>,
     sub_frames: &Arc<AtomicU64>,
 ) {
     let audio_codec = if cfg.audio.enabled {
@@ -907,22 +1408,23 @@ fn reconcile_streams(
     let _ = srt_stream_tx.send(Some(next_srt_handle));
 
     let norm_cam_path = normalize_stream_path(&cfg.webcam.channel_path);
-    if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+    if cfg.webcam.uses_channel() {
         if active_webcam_path.as_deref() != Some(&norm_cam_path)
             && let Some(old_path) = active_webcam_path.take()
         {
             registry.remove_stream(&old_path);
             *webcam_pipe = None;
         }
+        let cam_audio = (cfg.webcam.audio_enabled || cfg.audio.enabled).then_some(cfg.audio.codec);
         let handle = registry.add_or_update_stream(RtspStreamSpec {
             path: norm_cam_path.clone(),
             aliases: Vec::new(),
             name: format!("{} (Webcam)", cfg.onvif.device_name),
             video_codec: VideoCodecKind::H264,
-            audio_codec,
+            audio_codec: cam_audio,
             backchannel: false,
         });
-        let cam_cfg = build_webcam_stream_config(cfg);
+        let cam_cfg = webcam_main_stream_config(cfg);
         match webcam_pipe.as_mut() {
             Some(cam) => cam.reconfigure(cam_cfg, cfg.encoder.clone()),
             None => {
@@ -943,6 +1445,35 @@ fn reconcile_streams(
         }
         *webcam_pipe = None;
     }
+
+    if cfg.webcam.uses_virtual_onvif() {
+        let slots = virtual_webcam_slots
+            .read()
+            .expect("virtual webcam slots lock")
+            .clone();
+        if let Some(s) = slots {
+            let main_cfg = webcam_main_stream_config(cfg);
+            let sub_cfg = webcam_sub_stream_config(cfg);
+            *webcam_main_pipe = Some(StreamPipeline::new(
+                s.main_handle,
+                main_cfg,
+                cfg.encoder.clone(),
+                Arc::new(AtomicU64::new(0)),
+            ));
+            *webcam_sub_pipe = Some(StreamPipeline::new(
+                s.sub_handle,
+                sub_cfg,
+                cfg.encoder.clone(),
+                Arc::new(AtomicU64::new(0)),
+            ));
+        } else {
+            *webcam_main_pipe = None;
+            *webcam_sub_pipe = None;
+        }
+    } else {
+        *webcam_main_pipe = None;
+        *webcam_sub_pipe = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -956,9 +1487,11 @@ fn run_worker(
     sub_handle_slot: Arc<RwLock<Option<RtspStreamHandle>>>,
     srt_stream_tx: watch::Sender<Option<RtspStreamHandle>>,
     webcam_handle: Option<RtspStreamHandle>,
+    virtual_webcam_slots: Arc<RwLock<Option<VirtualWebcamHandles>>>,
     tracker_arc: Arc<RwLock<InputTracker>>,
     pos_osd: Arc<PosOsdStore>,
     events: EventBroker,
+    webcam_events: EventBroker,
     latest_frame: Arc<RwLock<Option<RawVideoFrame>>>,
     latest_bounds: Arc<RwLock<Option<MonitorBounds>>>,
     latest_pip: Arc<RwLock<Option<RawVideoFrame>>>,
@@ -997,14 +1530,42 @@ fn run_worker(
     let mut webcam_pipe = webcam_handle.map(|h| {
         StreamPipeline::new(
             h,
-            build_webcam_stream_config(&init_cfg),
+            webcam_main_stream_config(&init_cfg),
             init_cfg.encoder.clone(),
             Arc::new(AtomicU64::new(0)),
         )
     });
-    let mut active_webcam_path = (init_cfg.webcam.enabled
-        && init_cfg.webcam.mode == WebcamMode::Channel)
+    let mut active_webcam_path = init_cfg
+        .webcam
+        .uses_channel()
         .then(|| normalize_stream_path(&init_cfg.webcam.channel_path));
+
+    let (mut webcam_main_pipe, mut webcam_sub_pipe) = if init_cfg.webcam.uses_virtual_onvif() {
+        let slots = virtual_webcam_slots
+            .read()
+            .expect("virtual webcam slots lock")
+            .clone();
+        if let Some(s) = slots {
+            (
+                Some(StreamPipeline::new(
+                    s.main_handle,
+                    webcam_main_stream_config(&init_cfg),
+                    init_cfg.encoder.clone(),
+                    Arc::new(AtomicU64::new(0)),
+                )),
+                Some(StreamPipeline::new(
+                    s.sub_handle,
+                    webcam_sub_stream_config(&init_cfg),
+                    init_cfg.encoder.clone(),
+                    Arc::new(AtomicU64::new(0)),
+                )),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
 
     let mut recorder = RingRecorder::new(init_cfg.recording.clone()).unwrap_or_else(|e| {
         warn!(error = %e, "failed to initialize ring recorder; disabling recording");
@@ -1026,6 +1587,9 @@ fn run_worker(
                 &srt_stream_tx,
                 &mut webcam_pipe,
                 &mut active_webcam_path,
+                &virtual_webcam_slots,
+                &mut webcam_main_pipe,
+                &mut webcam_sub_pipe,
                 &sub_frames,
             );
             if !cfg.webcam.enabled {
@@ -1047,7 +1611,13 @@ fn run_worker(
             || cfg.recording.enabled;
         let need_webcam_channel = webcam_pipe
             .as_ref()
-            .is_some_and(|p| p.has_demand(cfg.always_on));
+            .is_some_and(|p| p.has_demand(cfg.always_on))
+            || webcam_main_pipe
+                .as_ref()
+                .is_some_and(|p| p.has_demand(cfg.always_on))
+            || webcam_sub_pipe
+                .as_ref()
+                .is_some_and(|p| p.has_demand(cfg.always_on));
 
         if !need_desktop && !need_webcam_channel {
             *active_encoder.write().expect("encoder lock") = "idle".to_string();
@@ -1065,7 +1635,7 @@ fn run_worker(
                 1
             })
             .max(
-                if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+                if cfg.webcam.uses_channel() || cfg.webcam.uses_virtual_onvif() {
                     cfg.webcam.fps
                 } else {
                     1
@@ -1110,6 +1680,26 @@ fn run_worker(
             None
         };
 
+        let cam_audio_active = (cfg.webcam.uses_channel() || cfg.webcam.uses_virtual_onvif())
+            && (cfg.webcam.audio_enabled || cfg.audio.enabled);
+        let effective_cam_mic = cfg
+            .webcam
+            .audio_device_name
+            .clone()
+            .or_else(|| cfg.audio.device_name.clone());
+        let reuse_desktop_audio = audio_src.is_some() && effective_cam_mic == cfg.audio.device_name;
+        let mut webcam_audio_src = if cam_audio_active && !reuse_desktop_audio {
+            let mut mic = AudioCaptureSource::new(effective_cam_mic);
+            if let Err(err) = mic.start() {
+                warn!(error = %err, "failed to start webcam microphone capture");
+                None
+            } else {
+                Some(mic)
+            }
+        } else {
+            None
+        };
+
         run_active_loop(
             &shared_cfg,
             &config_gen,
@@ -1119,12 +1709,17 @@ fn run_worker(
             screen_started,
             webcam_src.as_mut(),
             audio_src.as_mut(),
+            webcam_audio_src.as_mut(),
+            reuse_desktop_audio,
             &mut main_pipe,
             sub_pipe.as_mut(),
             webcam_pipe.as_mut(),
+            webcam_main_pipe.as_mut(),
+            webcam_sub_pipe.as_mut(),
             &tracker_arc,
             &pos_osd,
             &events,
+            &webcam_events,
             &latest_frame,
             &latest_pip,
             &active_encoder,
@@ -1143,6 +1738,9 @@ fn run_worker(
         if let Some(mut mic) = audio_src {
             mic.stop();
         }
+        if let Some(mut mic) = webcam_audio_src {
+            mic.stop();
+        }
         main_pipe.encoder = None;
         if let Some(sub) = sub_pipe.as_mut() {
             sub.encoder = None;
@@ -1150,7 +1748,30 @@ fn run_worker(
         if let Some(cam) = webcam_pipe.as_mut() {
             cam.encoder = None;
         }
+        if let Some(cam) = webcam_main_pipe.as_mut() {
+            cam.encoder = None;
+        }
+        if let Some(cam) = webcam_sub_pipe.as_mut() {
+            cam.encoder = None;
+        }
         recorder.flush_and_close();
+    }
+}
+
+fn publish_webcam_audio_packet(
+    pkt: nvrdesk_core::EncodedAudioFrame,
+    webcam_pipe: Option<&StreamPipeline>,
+    webcam_main_pipe: Option<&StreamPipeline>,
+    webcam_sub_pipe: Option<&StreamPipeline>,
+) {
+    if let Some(cam_p) = webcam_pipe {
+        cam_p.handle.publish_audio(pkt.clone());
+    }
+    if let Some(cam_m) = webcam_main_pipe {
+        cam_m.handle.publish_audio(pkt.clone());
+    }
+    if let Some(cam_s) = webcam_sub_pipe {
+        cam_s.handle.publish_audio(pkt);
     }
 }
 
@@ -1164,12 +1785,17 @@ fn run_active_loop(
     screen_started: bool,
     mut webcam_src: Option<&mut WebcamCaptureSource>,
     mut audio_src: Option<&mut AudioCaptureSource>,
+    mut webcam_audio_src: Option<&mut AudioCaptureSource>,
+    reuse_desktop_audio: bool,
     main_pipe: &mut StreamPipeline,
     mut sub_pipe: Option<&mut StreamPipeline>,
     mut webcam_pipe: Option<&mut StreamPipeline>,
+    mut webcam_main_pipe: Option<&mut StreamPipeline>,
+    mut webcam_sub_pipe: Option<&mut StreamPipeline>,
     tracker_arc: &Arc<RwLock<InputTracker>>,
     pos_osd: &PosOsdStore,
     events: &EventBroker,
+    webcam_events: &EventBroker,
     latest_frame: &Arc<RwLock<Option<RawVideoFrame>>>,
     latest_pip: &Arc<RwLock<Option<RawVideoFrame>>>,
     active_encoder: &Arc<RwLock<String>>,
@@ -1187,7 +1813,7 @@ fn run_active_loop(
             1
         })
         .max(
-            if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Channel {
+            if cfg.webcam.uses_channel() || cfg.webcam.uses_virtual_onvif() {
                 cfg.webcam.fps
             } else {
                 1
@@ -1203,6 +1829,7 @@ fn run_active_loop(
     let mut last_cam_frame: Option<RawVideoFrame> = None;
     let mut last_demand_at = Instant::now();
     let mut audio_pts: u32 = 0;
+    let mut webcam_audio_pts: u32 = 0;
     let bounds = screen_src.bounds();
     let mut screen_motion = MotionDetector::new();
     let mut webcam_motion = MotionDetector::new();
@@ -1218,9 +1845,16 @@ fn run_active_loop(
         let sub_active = sub_pipe
             .as_ref()
             .is_some_and(|p| p.has_demand(cfg.always_on));
-        let cam_active = webcam_pipe
+        let cam_chan_active = webcam_pipe
             .as_ref()
             .is_some_and(|p| p.has_demand(cfg.always_on));
+        let cam_virt_main_active = webcam_main_pipe
+            .as_ref()
+            .is_some_and(|p| p.has_demand(cfg.always_on));
+        let cam_virt_sub_active = webcam_sub_pipe
+            .as_ref()
+            .is_some_and(|p| p.has_demand(cfg.always_on));
+        let cam_active = cam_chan_active || cam_virt_main_active || cam_virt_sub_active;
 
         if main_active || sub_active || cam_active {
             last_demand_at = now;
@@ -1274,6 +1908,7 @@ fn run_active_loop(
                 )
             {
                 events.publish_motion("WebcamSource_1", ev.active);
+                webcam_events.publish_motion("VideoSource_1", ev.active);
             }
             *latest_pip.write().expect("latest_pip lock") = Some(cam_raw.clone());
             last_cam_frame = Some(cam_raw);
@@ -1287,9 +1922,27 @@ fn run_active_loop(
                 if let Some(sub) = sub_pipe.as_deref() {
                     sub.handle.publish_audio(pkt.clone());
                 }
-                if let Some(cam_p) = webcam_pipe.as_deref() {
-                    cam_p.handle.publish_audio(pkt);
+                if reuse_desktop_audio {
+                    publish_webcam_audio_packet(
+                        pkt,
+                        webcam_pipe.as_deref(),
+                        webcam_main_pipe.as_deref(),
+                        webcam_sub_pipe.as_deref(),
+                    );
                 }
+            }
+        }
+
+        if let Some(cam_mic) = webcam_audio_src.as_deref_mut() {
+            while let Ok(Some(samples)) = cam_mic.try_next_chunk(Duration::ZERO) {
+                let pkt = encode_g711(&samples, cfg.audio.codec, webcam_audio_pts);
+                webcam_audio_pts = webcam_audio_pts.wrapping_add(samples.len() as u32);
+                publish_webcam_audio_packet(
+                    pkt,
+                    webcam_pipe.as_deref(),
+                    webcam_main_pipe.as_deref(),
+                    webcam_sub_pipe.as_deref(),
+                );
             }
         }
 
@@ -1306,7 +1959,7 @@ fn run_active_loop(
                 None
             };
 
-            let pip = if cfg.webcam.enabled && cfg.webcam.mode == WebcamMode::Pip {
+            let pip = if cfg.webcam.uses_pip() {
                 last_cam_frame
                     .as_ref()
                     .map(|f| (f, cfg.webcam.pip_position, cfg.webcam.pip_scale))
@@ -1352,20 +2005,65 @@ fn run_active_loop(
             }
         }
 
-        if let Some(cam_pipe) = webcam_pipe.as_deref_mut()
-            && cam_active
-            && let Some(cam_raw) = &last_cam_frame
-            && let Some(encoded) = tick_stream_pipeline(
-                cam_pipe,
-                cam_raw,
-                None,
-                None,
-                None,
-                now,
-                (!main_active).then_some(active_encoder),
-            )
-        {
-            cam_pipe.handle.publish_frame(encoded);
+        if let Some(cam_pipe) = webcam_pipe.as_deref_mut() {
+            if cam_chan_active {
+                if let Some(cam_raw) = &last_cam_frame
+                    && let Some(encoded) = tick_stream_pipeline(
+                        cam_pipe,
+                        cam_raw,
+                        None,
+                        None,
+                        None,
+                        now,
+                        (!main_active).then_some(active_encoder),
+                    )
+                {
+                    cam_pipe.handle.publish_frame(encoded);
+                }
+            } else {
+                cam_pipe.encoder = None;
+            }
+        }
+
+        if let Some(cam_main) = webcam_main_pipe.as_deref_mut() {
+            if cam_virt_main_active {
+                if let Some(cam_raw) = &last_cam_frame
+                    && let Some(encoded) = tick_stream_pipeline(
+                        cam_main,
+                        cam_raw,
+                        None,
+                        None,
+                        None,
+                        now,
+                        (!main_active && !cam_chan_active).then_some(active_encoder),
+                    )
+                {
+                    cam_main.handle.publish_frame(encoded);
+                }
+            } else {
+                cam_main.encoder = None;
+            }
+        }
+
+        if let Some(cam_sub) = webcam_sub_pipe.as_deref_mut() {
+            if cam_virt_sub_active {
+                if let Some(cam_raw) = &last_cam_frame
+                    && let Some(encoded) = tick_stream_pipeline(
+                        cam_sub,
+                        cam_raw,
+                        None,
+                        None,
+                        None,
+                        now,
+                        (!main_active && !cam_chan_active && !cam_virt_main_active)
+                            .then_some(active_encoder),
+                    )
+                {
+                    cam_sub.handle.publish_frame(encoded);
+                }
+            } else {
+                cam_sub.encoder = None;
+            }
         }
 
         next_tick += tick_interval;

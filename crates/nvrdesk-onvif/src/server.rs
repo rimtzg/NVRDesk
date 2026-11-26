@@ -191,7 +191,7 @@ async fn handle_soap(
             if req.is_media2 {
                 soap::media2_get_profiles_response(&profiles, &state.meta)
             } else {
-                soap::get_profiles_response(&profiles)
+                soap::get_profiles_response_with_audio(&profiles, state.meta.audio_enabled)
             }
         }
         "GetProfile" => {
@@ -201,7 +201,9 @@ async fn handle_soap(
                 .and_then(|tok| profiles.iter().find(|p| p.token == tok))
                 .or_else(|| profiles.first());
             match found {
-                Some(p) => soap::get_profile_response(p, src_w, src_h),
+                Some(p) => {
+                    soap::get_profile_response_with_audio(p, src_w, src_h, state.meta.audio_enabled)
+                }
                 None => {
                     return soap_response(
                         StatusCode::BAD_REQUEST,
