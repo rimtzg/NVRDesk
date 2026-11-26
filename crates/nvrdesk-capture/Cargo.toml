@@ -16,3 +16,6 @@ nokhwa.workspace = true
 nvrdesk-core = { path = "../nvrdesk-core" }
 tracing.workspace = true
 xcap.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1.7", features = ["randr"] }

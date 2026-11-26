@@ -2567,6 +2567,7 @@ dependencies = [
  "nvrdesk-core",
  "tracing",
  "xcap",
+ "xcb",
 ]
 
 [[package]]
