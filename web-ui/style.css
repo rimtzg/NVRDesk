@@ -225,7 +225,57 @@ input, select, textarea {
   border-color: var(--accent);
 }
 .tab-panel { display: none; }
-.tab-panel.active { display: grid; }
+.tab-panel.active {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cfg-section {
+  background: #101620;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cfg-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.cfg-section-title {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+.cfg-subbox {
+  background: rgba(15, 20, 28, 0.72);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cfg-subtitle {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+.cfg-section input,
+.cfg-section select,
+.cfg-section textarea {
+  background: var(--surface);
+}
 
 .masks-launcher {
   display: flex;

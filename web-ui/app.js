@@ -115,6 +115,13 @@ function setFieldVisible(inputId, visible) {
   }
 }
 
+function setGroupVisible(id, visible) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.classList.toggle("is-hidden", !visible);
+  }
+}
+
 function syncConditionalFields() {
   const sourceKind = document.getElementById("cfg-source-kind").value;
   const usesUri = ["mp4", "mjpeg", "rtmp", "rtsp_relay", "ffmpeg_uri"].includes(sourceKind);
@@ -134,13 +141,12 @@ function syncConditionalFields() {
   const webcamAudioEnabled = usesWebcamStream
     && document.getElementById("cfg-webcam-audio-enabled").checked;
 
-  setFieldVisible("cfg-webcam-device", webcamEnabled);
-  setFieldVisible("cfg-webcam-mode", webcamEnabled);
+  setGroupVisible("webcam-settings-group", webcamEnabled);
+  setGroupVisible("webcam-virtual-onvif-group", usesVirtualOnvif);
+  setGroupVisible("webcam-audio-group", usesWebcamStream);
+
   setFieldVisible("cfg-webcam-virtual-onvif", webcamEnabled && canExtraVirtual);
   setFieldVisible("cfg-pip-pos", usesPip);
-  setFieldVisible("cfg-webcam-onvif-port", usesVirtualOnvif);
-  setFieldVisible("cfg-webcam-rtsp-port", usesVirtualOnvif);
-  setFieldVisible("cfg-webcam-audio-enabled", usesWebcamStream);
   setFieldVisible("cfg-webcam-audio-device", webcamAudioEnabled);
 
   const micEnabled = document.getElementById("cfg-audio-enabled").checked;
