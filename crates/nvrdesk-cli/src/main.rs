@@ -1,5 +1,7 @@
 //! NVRDesk CLI entrypoint launching the daemon (RTSP/ONVIF/Web UI) and System Tray.
 
+mod updater;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{
@@ -296,6 +298,18 @@ struct Cli {
     /// Target Linux desktop username for `--install-service` (defaults to `$SUDO_USER` / `$USER`).
     #[arg(long)]
     service_user: Option<String>,
+
+    /// Do not enable the periodic `.deb` auto-update systemd timer during `--install-service`.
+    #[arg(long, default_value_t = false)]
+    no_auto_update: bool,
+
+    /// Check GitHub Releases for a newer NVRDesk version and exit.
+    #[arg(long, default_value_t = false)]
+    check_update: bool,
+
+    /// Download, SHA-256 verify, and install the latest `.deb` release (Linux, requires root).
+    #[arg(long, default_value_t = false)]
+    self_update: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -361,6 +375,12 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.check_update {
+        return updater::check_update();
+    }
+    if cli.self_update {
+        return updater::self_update();
+    }
     if let Some(Commands::Fleet { action }) = cli.command {
         return handle_fleet_command(action);
     }
@@ -420,7 +440,13 @@ fn main() -> Result<()> {
 
     if cli.install_service {
         let target_cfg = config_path.as_deref().expect("service config path set");
-        return install_systemd_service(target_cfg, &cfg, cli.service_user.as_deref(), cli.no_tray);
+        return install_systemd_service(
+            target_cfg,
+            &cfg,
+            cli.service_user.as_deref(),
+            cli.no_tray,
+            !cli.no_auto_update,
+        );
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -845,6 +871,7 @@ fn install_systemd_service(
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
     headless: bool,
+    auto_update: bool,
 ) -> Result<()> {
     use anyhow::Context;
     use std::process::Command;
@@ -890,6 +917,29 @@ fn install_systemd_service(
         )
     })?;
 
+    let updater_svc_path = PathBuf::from("/etc/systemd/system/nvrdesk-updater.service");
+    let updater_timer_path = PathBuf::from("/etc/systemd/system/nvrdesk-updater.timer");
+    if auto_update {
+        std::fs::write(
+            &updater_svc_path,
+            updater::render_updater_service(&exe_path),
+        )
+        .with_context(|| {
+            format!(
+                "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+                updater_svc_path.display()
+            )
+        })?;
+        std::fs::write(&updater_timer_path, updater::render_updater_timer()).with_context(
+            || {
+                format!(
+                    "failed to write {} (run with sudo: `sudo nvrdesk --install-service`)",
+                    updater_timer_path.display()
+                )
+            },
+        )?;
+    }
+
     let reload = Command::new("systemctl")
         .arg("daemon-reload")
         .status()
@@ -911,10 +961,28 @@ fn install_systemd_service(
         .args(["restart", &unit_instance])
         .status();
 
+    if auto_update {
+        let enable_timer = Command::new("systemctl")
+            .args(["enable", "--now", "nvrdesk-updater.timer"])
+            .status()
+            .context("failed to enable nvrdesk-updater.timer")?;
+        if !enable_timer.success() {
+            anyhow::bail!(
+                "`systemctl enable --now nvrdesk-updater.timer` exited with {enable_timer}"
+            );
+        }
+    }
+
     println!("Installed NVRDesk systemd service:");
     println!("  Config : {}", config_path.display());
     println!("  Unit   : {}", unit_path.display());
     println!("  Service: {unit_instance} (enabled & started)");
+    if auto_update {
+        println!(
+            "  Updater: {} (enabled, checks GitHub Releases every 12h)",
+            updater_timer_path.display()
+        );
+    }
     println!("  Logs   : journalctl -u {unit_instance} -f");
     Ok(())
 }
@@ -925,8 +993,9 @@ fn install_systemd_service(
     cfg: &NvrDeskConfig,
     explicit_user: Option<&str>,
     headless: bool,
+    auto_update: bool,
 ) -> Result<()> {
-    let _ = (config_path, cfg, explicit_user, headless);
+    let _ = (config_path, cfg, explicit_user, headless, auto_update);
     anyhow::bail!(
         "`--install-service` is only supported on Linux (systemd). Use `packaging/fleet/windows/Install-NvrDeskPos.ps1` on Windows or `packaging/fleet/macos/com.nvrdesk.agent.plist` on macOS."
     )

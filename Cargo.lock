@@ -2588,6 +2588,7 @@ dependencies = [
  "nvrdesk-tray",
  "serde_json",
  "sha1 0.11.0",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "toml",
